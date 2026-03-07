@@ -68,6 +68,13 @@ config = KubernetesProviderConfig(
 
     # Extra environment variables injected into every sandbox container
     extra_env={"MY_VAR": "value"},
+
+    # UID/GID the sandbox container runs as (set to None for OpenShift)
+    run_as_user=1000,
+    run_as_group=1000,
+
+    # seccompProfile type (set to None for OpenShift < 4.11)
+    seccomp_profile="RuntimeDefault",
 )
 
 provider = KubernetesProvider(config=config)
@@ -193,13 +200,39 @@ provider.delete(sandbox_id=sandbox.id)
 
 Every Pod is created with hardened defaults:
 
-- `runAsNonRoot: true` (UID/GID 1000)
+- `runAsNonRoot: true`
+- `runAsUser: 1000` / `runAsGroup: 1000` (configurable, see OpenShift below)
 - `allowPrivilegeEscalation: false`
 - `capabilities.drop: [ALL]`
-- `seccompProfile.type: RuntimeDefault`
+- `seccompProfile.type: RuntimeDefault` (configurable, see OpenShift below)
 - `automountServiceAccountToken: false`
 
 When `block_network=True` (default), a deny-all `NetworkPolicy` is attached to the Pod, blocking all ingress and egress traffic.
+
+## OpenShift
+
+OpenShift's default **restricted SCC** enforces that Pods run with a UID from the namespace's pre-allocated range and does not allow setting an arbitrary `runAsUser`. OpenShift < 4.11 also rejects the `seccompProfile` field.
+
+Set `run_as_user=None`, `run_as_group=None`, and `seccomp_profile=None` to omit those fields and let OpenShift handle them:
+
+```python
+config = KubernetesProviderConfig(
+    # Let OpenShift assign the UID from the namespace-allocated range
+    run_as_user=None,
+    run_as_group=None,
+
+    # Omit seccompProfile for OpenShift < 4.11; keep "RuntimeDefault" for >= 4.11
+    seccomp_profile=None,
+
+    # Use an image that supports arbitrary UIDs (files writable by group 0)
+    image="python:3.12-slim",
+)
+provider = KubernetesProvider(config=config)
+```
+
+The container image must support running as an arbitrary UID. The standard practice is to make application files readable/writable by group `0` (`chmod -R g=u`), as OpenShift follows this convention.
+
+NetworkPolicy enforcement on OpenShift works as-is with both the OVN-Kubernetes and OpenShift SDN CNI plugins.
 
 ## Namespace isolation
 

@@ -72,19 +72,24 @@ def build_pod_manifest(
     # Build environment variables
     env = [{"name": k, "value": v} for k, v in config.extra_env.items()]
 
+    security_context: dict[str, Any] = {
+        "allowPrivilegeEscalation": False,
+        "runAsNonRoot": True,
+        "capabilities": {"drop": ["ALL"]},
+    }
+    if config.run_as_user is not None:
+        security_context["runAsUser"] = config.run_as_user
+    if config.run_as_group is not None:
+        security_context["runAsGroup"] = config.run_as_group
+    if config.seccomp_profile is not None:
+        security_context["seccompProfile"] = {"type": config.seccomp_profile}
+
     container: dict[str, Any] = {
         "name": config.container_name,
         "image": config.image,
         "imagePullPolicy": config.image_pull_policy,
         "command": ["sleep", "infinity"],
-        "securityContext": {
-            "allowPrivilegeEscalation": False,
-            "runAsNonRoot": True,
-            "runAsUser": 1000,
-            "runAsGroup": 1000,
-            "capabilities": {"drop": ["ALL"]},
-            "seccompProfile": {"type": "RuntimeDefault"},
-        },
+        "securityContext": security_context,
     }
     if resources:
         container["resources"] = resources

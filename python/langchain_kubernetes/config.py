@@ -37,6 +37,15 @@ class KubernetesProviderConfig:
             service-account credentials or the default ``~/.kube/config``.
         context: Kubernetes context name to use from the kubeconfig.  ``None``
             uses the active context.
+        run_as_user: UID the sandbox container runs as.  ``None`` omits the
+            field and lets the cluster assign a UID — required for OpenShift,
+            which enforces a namespace-allocated UID range via SCC.
+        run_as_group: GID the sandbox container runs as.  ``None`` omits the
+            field, same rationale as ``run_as_user``.
+        seccomp_profile: seccompProfile type applied to the container (e.g.
+            ``"RuntimeDefault"``).  Set to ``None`` to omit the field entirely,
+            which is necessary for OpenShift < 4.11 where the field is not
+            supported.
     """
 
     namespace: str = "deepagents-sandboxes"
@@ -54,3 +63,6 @@ class KubernetesProviderConfig:
     kubeconfig: str | None = None
     context: str | None = None
     extra_env: dict[str, str] = field(default_factory=dict)
+    run_as_user: int | None = 1000
+    run_as_group: int | None = 1000
+    seccomp_profile: str | None = "RuntimeDefault"

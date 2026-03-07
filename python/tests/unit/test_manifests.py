@@ -78,8 +78,34 @@ class TestPodManifest:
         sc = m["spec"]["containers"][0]["securityContext"]
         assert sc["runAsNonRoot"] is True
         assert sc["runAsUser"] == 1000
+        assert sc["runAsGroup"] == 1000
         assert sc["allowPrivilegeEscalation"] is False
         assert "ALL" in sc["capabilities"]["drop"]
+        assert sc["seccompProfile"] == {"type": "RuntimeDefault"}
+
+    def test_security_context_openshift_mode(self):
+        """When run_as_user/run_as_group/seccomp_profile are None, fields are omitted."""
+        cfg = self._config(run_as_user=None, run_as_group=None, seccomp_profile=None)
+        m = build_pod_manifest(pod_name="p", namespace="ns", sandbox_id="s", config=cfg)
+        sc = m["spec"]["containers"][0]["securityContext"]
+        assert sc["runAsNonRoot"] is True
+        assert "runAsUser" not in sc
+        assert "runAsGroup" not in sc
+        assert "seccompProfile" not in sc
+        assert sc["allowPrivilegeEscalation"] is False
+
+    def test_security_context_custom_uid(self):
+        cfg = self._config(run_as_user=2000, run_as_group=2000)
+        m = build_pod_manifest(pod_name="p", namespace="ns", sandbox_id="s", config=cfg)
+        sc = m["spec"]["containers"][0]["securityContext"]
+        assert sc["runAsUser"] == 2000
+        assert sc["runAsGroup"] == 2000
+
+    def test_security_context_custom_seccomp(self):
+        cfg = self._config(seccomp_profile="Localhost")
+        m = build_pod_manifest(pod_name="p", namespace="ns", sandbox_id="s", config=cfg)
+        sc = m["spec"]["containers"][0]["securityContext"]
+        assert sc["seccompProfile"] == {"type": "Localhost"}
 
     def test_no_service_account_token(self):
         m = build_pod_manifest(
