@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-kubernetes"
+version = "0.1.0"
+description = "Kubernetes sandbox integration for Deep Agents"
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "deepagents>=0.4.3",
+    "kubernetes>=31.0.0",
+]
+
+[project.optional-dependencies]
+async = ["kubernetes_asyncio>=31.0.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-mock>=3.0",
+    "kubernetes_asyncio>=31.0.0",
+]
+
+[project.urls]
+Repository = "https://github.com/langchain-ai/deepagents"
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_kubernetes"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "integration: marks tests as integration tests requiring a live cluster (deselect with '-m not integration')",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
