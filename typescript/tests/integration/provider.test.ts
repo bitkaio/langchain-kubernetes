@@ -29,6 +29,7 @@ describe.skipIf(!INTEGRATION_ENABLED)("KubernetesProvider integration", () => {
 
   function makeProvider(overrides?: Record<string, unknown>): KubernetesProvider {
     return new KubernetesProvider({
+      mode: "raw",
       namespace: testNamespace,
       image: "python:3.12-slim",
       blockNetwork: false,

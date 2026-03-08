@@ -19,8 +19,7 @@ export class SandboxNotFoundError extends SandboxError {
 }
 
 /**
- * Thrown when the sandbox Pod does not reach the Running phase within the
- * configured startup timeout.
+ * Thrown when the sandbox does not become ready within the configured timeout.
  */
 export class SandboxStartupTimeoutError extends SandboxError {
   constructor(sandboxId: string, timeoutSeconds: number, options?: ErrorOptions) {
@@ -53,5 +52,41 @@ export class NamespaceConflictError extends SandboxError {
       options
     );
     this.name = "NamespaceConflictError";
+  }
+}
+
+/**
+ * Thrown when the sandbox-router or Kubernetes API is not reachable.
+ */
+export class SandboxRouterError extends SandboxError {
+  constructor(message: string, readonly url: string, options?: ErrorOptions) {
+    super(`${message} (url: ${url})`, options);
+    this.name = "SandboxRouterError";
+  }
+}
+
+/**
+ * Thrown when the requested SandboxTemplate does not exist.
+ */
+export class TemplateNotFoundError extends SandboxError {
+  constructor(templateName: string, namespace: string, options?: ErrorOptions) {
+    super(
+      `SandboxTemplate "${templateName}" not found in namespace "${namespace}"`,
+      options
+    );
+    this.name = "TemplateNotFoundError";
+  }
+}
+
+/**
+ * Thrown when a required optional dependency is not installed.
+ */
+export class MissingDependencyError extends SandboxError {
+  constructor(mode: string, installCommand: string, options?: ErrorOptions) {
+    super(
+      `Missing dependencies for ${mode} mode. Install with: ${installCommand}`,
+      options
+    );
+    this.name = "MissingDependencyError";
   }
 }

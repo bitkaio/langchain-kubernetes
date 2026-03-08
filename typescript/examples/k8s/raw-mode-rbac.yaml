@@ -1,0 +1,36 @@
+# RBAC for langchain-kubernetes raw mode.
+# Grants the service account permission to manage Pods, Namespaces,
+# NetworkPolicies, and ResourceQuotas.
+#
+# Apply with: kubectl apply -f raw-mode-rbac.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: langchain-kubernetes-raw-sa
+  namespace: deepagents-sandboxes
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: langchain-kubernetes-raw-role
+rules:
+- apiGroups: [""]
+  resources: ["pods", "namespaces", "resourcequotas"]
+  verbs: ["create", "delete", "get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["create", "delete", "get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: langchain-kubernetes-raw-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: langchain-kubernetes-raw-role
+subjects:
+- kind: ServiceAccount
+  name: langchain-kubernetes-raw-sa
+  namespace: deepagents-sandboxes

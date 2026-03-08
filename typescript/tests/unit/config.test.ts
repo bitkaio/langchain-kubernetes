@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   resolveConfig,
   resolveExecuteConfig,
+  validateConfig,
   defaultConfig,
   defaultExecuteConfig,
 } from "../../src/config.js";
@@ -60,6 +61,32 @@ describe("resolveConfig", () => {
   it("accepts env map", () => {
     const cfg = resolveConfig({ env: { FOO: "bar", BAZ: "42" } });
     expect(cfg.env).toEqual({ FOO: "bar", BAZ: "42" });
+  });
+});
+
+describe("validateConfig", () => {
+  it("throws when mode=agent-sandbox and routerUrl is missing", () => {
+    const cfg = resolveConfig({ mode: "agent-sandbox", templateName: "tpl" });
+    expect(() => validateConfig(cfg)).toThrow(/routerUrl/);
+  });
+
+  it("throws when mode=agent-sandbox and templateName is missing", () => {
+    const cfg = resolveConfig({ mode: "agent-sandbox", routerUrl: "http://router:8080" });
+    expect(() => validateConfig(cfg)).toThrow(/templateName/);
+  });
+
+  it("passes when mode=agent-sandbox with routerUrl and templateName", () => {
+    const cfg = resolveConfig({
+      mode: "agent-sandbox",
+      routerUrl: "http://router:8080",
+      templateName: "python-template",
+    });
+    expect(() => validateConfig(cfg)).not.toThrow();
+  });
+
+  it("passes when mode=raw (no router fields required)", () => {
+    const cfg = resolveConfig({ mode: "raw" });
+    expect(() => validateConfig(cfg)).not.toThrow();
   });
 });
 

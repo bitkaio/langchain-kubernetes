@@ -2,27 +2,57 @@
 
 Kubernetes sandbox provider for the [DeepAgents](https://github.com/langchain-ai/deepagents) framework. Available for both Python and TypeScript.
 
-Runs each sandbox as an ephemeral Kubernetes Pod with `sleep infinity`. Code execution goes through the Kubernetes exec API (WebSocket). File transfer uses tar-piped exec. Network isolation is enforced with a deny-all `NetworkPolicy` by default.
+Supports two backend modes:
+
+- **`agent-sandbox` mode** (default, recommended) — integrates with [`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox). Requires the controller + CRDs installed in the cluster. Provides warm pools, gVisor/Kata isolation, and sub-second startup.
+- **`raw` mode** (fallback) — directly manages ephemeral Pods via the Kubernetes API. Works on any cluster with no CRD installation. Uses tar-piped exec for file transfer and a deny-all NetworkPolicy for network isolation.
 
 ## Packages
 
 | Package | Registry | Language |
 |---|---|---|
-| `langchain-kubernetes` | PyPI | Python ≥ 3.10 |
+| `langchain-kubernetes` | PyPI | Python ≥ 3.11 |
 | `langchain-kubernetes` | npm | Node.js ≥ 18 |
 
 ## Quick start
 
 ### Python
 
+**agent-sandbox mode** (default — requires agent-sandbox controller in cluster):
+
 ```bash
-pip install langchain-kubernetes
+pip install "langchain-kubernetes[agent-sandbox]"
 ```
 
 ```python
-from langchain_kubernetes import KubernetesProvider
+from langchain_kubernetes import KubernetesProvider, KubernetesProviderConfig
 
-provider = KubernetesProvider()
+provider = KubernetesProvider(KubernetesProviderConfig(
+    template_name="python-sandbox-template",
+))
+sandbox = provider.get_or_create()
+
+try:
+    result = sandbox.execute("python3 -c 'print(2 + 2)'")
+    print(result.output)    # "4"
+    print(result.exit_code) # 0
+finally:
+    provider.delete(sandbox_id=sandbox.id)
+```
+
+**raw mode** (fallback — works on any cluster, no CRDs required):
+
+```bash
+pip install "langchain-kubernetes[raw]"
+```
+
+```python
+from langchain_kubernetes import KubernetesProvider, KubernetesProviderConfig
+
+provider = KubernetesProvider(KubernetesProviderConfig(
+    mode="raw",
+    image="python:3.12-slim",
+))
 sandbox = provider.get_or_create()
 
 try:
@@ -36,13 +66,42 @@ finally:
 ### TypeScript
 
 ```bash
-npm install langchain-kubernetes
+npm install @bitkaio/langchain-kubernetes
+```
+
+**agent-sandbox mode** (default — requires agent-sandbox controller in cluster):
+
+```typescript
+import { KubernetesProvider } from "@bitkaio/langchain-kubernetes";
+
+const provider = new KubernetesProvider({
+  mode: "agent-sandbox",
+  routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
+  templateName: "python-sandbox-template",
+});
+const sandbox = await provider.getOrCreate();
+
+try {
+    const result = await sandbox.execute("python3 -c 'print(42)'");
+    console.log(result.output); // "42\n"
+} finally {
+    await provider.delete(sandbox.id);
+}
+```
+
+**raw mode** (fallback — works on any cluster, requires `@kubernetes/client-node`):
+
+```bash
+npm install @bitkaio/langchain-kubernetes @kubernetes/client-node tar-stream
 ```
 
 ```typescript
-import { KubernetesProvider } from "langchain-kubernetes";
+import { KubernetesProvider } from "@bitkaio/langchain-kubernetes";
 
-const provider = new KubernetesProvider({ image: "python:3.12-slim" });
+const provider = new KubernetesProvider({
+  mode: "raw",
+  image: "python:3.12-slim",
+});
 const sandbox = await provider.getOrCreate();
 
 try {
@@ -63,7 +122,7 @@ from langchain_kubernetes import KubernetesProvider
 provider = KubernetesProvider()
 sandbox = provider.get_or_create()
 
-llm = ChatAnthropic(model="claude-opus-4-5")
+llm = ChatAnthropic(model="claude-opus-4-6")
 agent = create_agent(llm, backend=sandbox)
 
 result = agent.invoke({"messages": [("user", "Write and run a Python script that prints the Fibonacci sequence")]})
@@ -88,7 +147,7 @@ Every Pod is created with hardened defaults:
 
 ```
 langchain-kubernetes/
-├── python/       # Python package (hatchling, PEP 621)
+├── python/       # Python package (Poetry)
 └── typescript/   # TypeScript package (ESM + CJS dual build)
 ```
 

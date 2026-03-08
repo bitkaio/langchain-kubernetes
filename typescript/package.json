@@ -1,9 +1,9 @@
 {
-  "name": "langchain-kubernetes",
-  "version": "0.1.0",
+  "name": "@bitkaio/langchain-kubernetes",
+  "version": "0.0.1",
   "description": "Kubernetes sandbox provider for the DeepAgents framework",
   "license": "MIT",
-  "author": "LangChain",
+  "author": "bitkaio LLC",
   "keywords": [
     "langchain",
     "deepagents",
@@ -37,11 +37,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "deepagents": ">=0.1.0",
+    "deepagents": ">=0.1.0"
+  },
+  "optionalDependencies": {
     "@kubernetes/client-node": "^1.0.0",
     "tar-stream": "^3.1.0"
   },
   "devDependencies": {
+    "@kubernetes/client-node": "^1.0.0",
+    "tar-stream": "^3.1.0",
     "typescript": "^5.5.0",
     "vitest": "^2.0.0",
     "@types/node": "^22.0.0",
@@ -52,6 +56,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/langchain-ai/langchain-kubernetes"
+    "url": "https://gitlab.com/bitkaio/langchain/deepagents-kubernetes-sandbox"
   }
 }

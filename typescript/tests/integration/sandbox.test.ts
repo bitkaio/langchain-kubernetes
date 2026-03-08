@@ -23,6 +23,7 @@ describe.skipIf(!INTEGRATION_ENABLED)("KubernetesSandbox integration", () => {
     await createTestNamespace(coreApi, testNamespace);
 
     provider = new KubernetesProvider({
+      mode: "raw",
       namespace: testNamespace,
       image: "python:3.12-slim",
       blockNetwork: false, // network isolation not needed for basic exec tests

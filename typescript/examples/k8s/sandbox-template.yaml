@@ -1,0 +1,42 @@
+# SandboxTemplate — defines the Pod spec for agent-sandbox mode.
+# Apply with: kubectl apply -f sandbox-template.yaml
+#
+# Requires kubernetes-sigs/agent-sandbox controller and CRDs installed.
+# See: https://github.com/kubernetes-sigs/agent-sandbox
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: python-sandbox-template
+  namespace: default
+spec:
+  podTemplate:
+    spec:
+      containers:
+      - name: python-runtime
+        # The sandbox runtime image must serve the HTTP API on port 8888.
+        # The official example image:
+        image: us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/python-runtime-sandbox:latest-main
+        ports:
+        - containerPort: 8888
+        readinessProbe:
+          httpGet:
+            path: "/"
+            port: 8888
+          initialDelaySeconds: 0
+          periodSeconds: 1
+        livenessProbe:
+          httpGet:
+            path: "/"
+            port: 8888
+          initialDelaySeconds: 2
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "512Mi"
+            ephemeral-storage: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+            ephemeral-storage: "5Gi"
+      restartPolicy: "OnFailure"
