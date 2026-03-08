@@ -1,40 +1,53 @@
 # langchain-kubernetes
 
-Kubernetes sandbox provider for [DeepAgents](https://github.com/langchain-ai/deepagents), backed by the community-standard [`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox) controller.
+Kubernetes sandbox provider for [DeepAgents](https://github.com/langchain-ai/deepagents). Run AI agent code in isolated, stateful Kubernetes sandboxes.
 
-Run AI agent code in isolated, stateful Kubernetes sandboxes — including air-gapped and regulated environments. Supports gVisor, Kata Containers, warm pools for sub-second startup, and all sandbox isolation features from the agent-sandbox controller.
+Two backend modes are supported — pick the one that fits your cluster:
+
+| Mode | When to use | Install |
+|------|-------------|---------|
+| **`agent-sandbox`** (default) | Full-featured: warm pools, gVisor/Kata, sub-second startup. Requires the [`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox) controller. | `pip install langchain-kubernetes[agent-sandbox]` |
+| **`raw`** | Works on any cluster with no extra controllers or CRDs. Direct Pod management. | `pip install langchain-kubernetes[raw]` |
 
 ---
 
-## Prerequisites
+## Installation
 
-**This package does not install or manage the agent-sandbox controller.** The following must already be deployed in your cluster before using this package:
+```bash
+# agent-sandbox mode (recommended when you can install the controller)
+pip install langchain-kubernetes[agent-sandbox]
+
+# raw mode (any cluster, no controller required)
+pip install langchain-kubernetes[raw]
+
+# both modes
+pip install langchain-kubernetes[all]
+```
+
+---
+
+## agent-sandbox Mode
+
+### Prerequisites
+
+**This mode does not install or manage the agent-sandbox controller.** The following must already be deployed in your cluster:
 
 1. **agent-sandbox controller + CRDs** — manages `Sandbox`, `SandboxTemplate`, `SandboxClaim`, and `SandboxWarmPool` resources.
 2. **sandbox-router** — HTTP gateway that routes traffic from the SDK to sandbox Pods.
 3. **A `SandboxTemplate` CR** — defines the sandbox blueprint (image, resources, runtime class, security).
 
-### Install the controller
+**Install the controller:**
 
 ```bash
 export VERSION="v0.1.0"
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/manifest.yaml
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/extensions.yaml
-```
-
-Full installation guide: https://agent-sandbox.sigs.k8s.io/docs/getting_started/
-
-### Deploy the sandbox-router
-
-The sandbox-router is required for the Python SDK to communicate with sandbox Pods:
-
-```bash
 kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/sandbox-router.yaml
 ```
 
-### Create a SandboxTemplate
+Full guide: https://agent-sandbox.sigs.k8s.io/docs/getting_started/
 
-Apply the example template from this repo or write your own:
+**Create a SandboxTemplate:**
 
 ```bash
 kubectl apply -f examples/k8s/sandbox-template.yaml
@@ -63,23 +76,15 @@ spec:
               memory: 512Mi
 ```
 
----
-
-## Installation
-
-```bash
-pip install langchain-kubernetes
-```
-
----
-
-## Quick Start
+### Quick Start
 
 ```python
 from langchain_kubernetes import KubernetesProvider, KubernetesProviderConfig
 
 provider = KubernetesProvider(
-    KubernetesProviderConfig(template_name="python-sandbox-template")
+    KubernetesProviderConfig(
+        template_name="python-sandbox-template",
+    )
 )
 
 sandbox = provider.get_or_create()
@@ -91,54 +96,238 @@ finally:
     provider.delete(sandbox_id=sandbox.id)
 ```
 
----
+### Configuration
 
-## Cluster Setup
+```python
+KubernetesProviderConfig(
+    # Required: SandboxTemplate CR name (must exist in the cluster)
+    template_name="python-sandbox-template",
 
-### 1. Verify prerequisites
+    # Kubernetes namespace where sandboxes are created
+    namespace="default",
 
-```bash
-# Check controller is running
-kubectl get pods -n agent-sandbox-system
+    # How to connect to the sandbox-router:
+    #   "tunnel"  — auto port-forward via kubectl (default, good for local dev)
+    #   "gateway" — route through a Kubernetes Gateway resource
+    #   "direct"  — connect to an explicit URL (for in-cluster or custom domains)
+    connection_mode="tunnel",
 
-# Check CRDs are installed
-kubectl get crds | grep agents.x-k8s.io
+    # For gateway mode
+    gateway_name=None,
+    gateway_namespace="default",
 
-# Check sandbox-router
-kubectl get pods -l app=sandbox-router
+    # For direct mode
+    api_url=None,
 
-# Check your SandboxTemplate exists
-kubectl get sandboxtemplate python-sandbox-template
+    # Port the sandbox runtime listens on
+    server_port=8888,
+
+    # Seconds to wait for sandbox to become ready
+    startup_timeout_seconds=120,
+
+    # Default per-execute() timeout in seconds
+    default_exec_timeout=1800,
+)
 ```
 
-### 2. Apply a SandboxTemplate
+**Connection modes:**
 
-```bash
-kubectl apply -f examples/k8s/sandbox-template.yaml
-```
+| Mode | When to use | Required field |
+|------|-------------|----------------|
+| `tunnel` (default) | Local dev, `kubectl` available | — |
+| `gateway` | Production with a Kubernetes Gateway resource | `gateway_name` |
+| `direct` | In-cluster agents or custom sandbox-router URL | `api_url` |
 
-### 3. (Optional) Apply a SandboxWarmPool
+### Optional: Warm Pools
 
-For sub-second sandbox startup, pre-warm a pool of Pods:
+Pre-warm a pool of sandbox Pods to eliminate cold-start latency:
 
 ```bash
 kubectl apply -f examples/k8s/warm-pool.yaml
+```
+
+```yaml
+# examples/k8s/warm-pool.yaml
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxWarmPool
+metadata:
+  name: python-warm-pool
+  namespace: default
+spec:
+  templateRef:
+    name: python-sandbox-template
+  size: 3  # keep 3 Pods warm at all times
+```
+
+---
+
+## Raw Mode
+
+Use this when you cannot install the agent-sandbox controller — locked-down OpenShift clusters, environments where CRD installation requires lengthy approval processes, or air-gapped clusters without access to controller images.
+
+Raw mode directly creates and manages ephemeral Pods via the Kubernetes API. No CRDs, no controllers, no sandbox-router. All work happens through the Kubernetes exec API.
+
+**Tradeoffs vs agent-sandbox mode:**
+
+| | agent-sandbox | raw |
+|--|--|--|
+| Controller required | Yes | No |
+| CRDs required | Yes | No |
+| Warm pools | Yes | No |
+| gVisor / Kata | Yes (via SandboxTemplate) | Depends on cluster |
+| Startup time | Sub-second (warm) | ~5–30s (Pod scheduling) |
+| Pod-level config | In SandboxTemplate CRD | In `KubernetesProviderConfig` |
+
+### RBAC
+
+The process running this package needs a ServiceAccount / kubeconfig with:
+
+```yaml
+rules:
+- apiGroups: [""]
+  resources: ["pods", "pods/exec", "pods/log", "namespaces"]
+  verbs: ["get", "list", "create", "delete", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "create", "delete"]
+- apiGroups: [""]
+  resources: ["resourcequotas"]
+  verbs: ["get", "create", "delete"]
+```
+
+The sandbox Pod's own ServiceAccount has no RBAC bindings (`automountServiceAccountToken: false`).
+
+### Quick Start
+
+```python
+from langchain_kubernetes import KubernetesProvider, KubernetesProviderConfig
+
+provider = KubernetesProvider(
+    KubernetesProviderConfig(
+        mode="raw",
+        namespace="default",
+        image="python:3.12-slim",
+    )
+)
+
+sandbox = provider.get_or_create()
+try:
+    result = sandbox.execute("python3 -c 'print(2 + 2)'")
+    print(result.output)     # "4\n"
+    print(result.exit_code)  # 0
+finally:
+    provider.delete(sandbox_id=sandbox.id)
+```
+
+### Configuration
+
+```python
+KubernetesProviderConfig(
+    mode="raw",
+
+    # Kubernetes namespace where Pods are created
+    namespace="default",
+
+    # Container image
+    image="python:3.12-slim",
+    image_pull_policy="IfNotPresent",
+    image_pull_secrets=[],          # list of Secret names
+
+    # Working directory inside the container
+    workdir="/workspace",
+
+    # Pod entrypoint (default: sleep infinity — all work via exec)
+    command=["sleep", "infinity"],
+
+    # Environment variables
+    env={"MY_VAR": "value"},
+
+    # Resource requests and limits
+    cpu_request="100m",
+    cpu_limit="1000m",
+    memory_request="256Mi",
+    memory_limit="1Gi",
+    ephemeral_storage_limit="5Gi",
+
+    # Network isolation: deny-all NetworkPolicy (strongly recommended)
+    block_network=True,
+
+    # Security context
+    run_as_user=1000,
+    run_as_group=1000,
+    seccomp_profile="RuntimeDefault",  # or "Localhost"
+
+    # Per-sandbox namespace (stronger isolation, slower, more RBAC)
+    namespace_per_sandbox=False,
+
+    # ServiceAccount for the sandbox Pod (default: none)
+    service_account=None,
+
+    # Scheduling
+    node_selector={},
+    tolerations=[],
+
+    # Extra volumes / mounts
+    volumes=[],
+    volume_mounts=[],
+    init_containers=[],
+
+    # Low-level Pod spec overrides (deep-merged into spec)
+    pod_template_overrides=None,
+
+    # Pod annotations
+    extra_annotations={},
+
+    # Shell script run as first exec after creation
+    setup_script=None,
+
+    # Timeouts
+    startup_timeout_seconds=120,
+    default_exec_timeout=1800,
+)
+```
+
+### Security defaults
+
+Raw mode Pods always enforce:
+
+```yaml
+automountServiceAccountToken: false
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000       # configurable
+  runAsGroup: 1000      # configurable
+containers:
+  - securityContext:
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault   # configurable
 ```
 
 ---
 
 ## Usage with DeepAgents
 
+Works the same regardless of mode:
+
 ```python
 from langchain_anthropic import ChatAnthropic
 from deepagents import create_agent
 from langchain_kubernetes import KubernetesProvider, KubernetesProviderConfig
 
+# agent-sandbox mode
 provider = KubernetesProvider(
     KubernetesProviderConfig(template_name="python-sandbox-template")
 )
-sandbox = provider.get_or_create()
 
+# or raw mode
+provider = KubernetesProvider(
+    KubernetesProviderConfig(mode="raw", image="python:3.12-slim")
+)
+
+sandbox = provider.get_or_create()
 llm = ChatAnthropic(model="claude-opus-4-5")
 agent = create_agent(llm, backend=sandbox)
 
@@ -155,92 +344,18 @@ provider.delete(sandbox_id=sandbox.id)
 ## Usage with CLI
 
 ```bash
+# agent-sandbox mode
 deepagents --sandbox kubernetes --template-name python-sandbox-template
-```
 
-With gateway mode:
-
-```bash
+# gateway mode
 deepagents --sandbox kubernetes \
   --template-name python-sandbox-template \
   --connection-mode gateway \
   --gateway-name my-gateway
+
+# raw mode
+deepagents --sandbox kubernetes --mode raw
 ```
-
----
-
-## Configuration Reference
-
-```python
-from langchain_kubernetes import KubernetesProviderConfig
-
-config = KubernetesProviderConfig(
-    # Required: SandboxTemplate CR name (must exist in the cluster)
-    template_name="python-sandbox-template",
-
-    # Kubernetes namespace where sandboxes are created
-    namespace="default",
-
-    # How to connect to the sandbox-router:
-    #   "tunnel"  — auto port-forward via kubectl (default, good for local dev)
-    #   "gateway" — route through a Kubernetes Gateway resource
-    #   "direct"  — connect to an explicit URL (for in-cluster or custom domains)
-    connection_mode="tunnel",
-
-    # For gateway mode: name of the Gateway resource
-    gateway_name=None,
-
-    # For gateway mode: namespace of the Gateway resource
-    gateway_namespace="default",
-
-    # For direct mode: full URL of the sandbox-router
-    api_url=None,
-
-    # Port that the sandbox runtime listens on
-    server_port=8888,
-
-    # Seconds to wait for a sandbox to become ready before raising TimeoutError
-    startup_timeout_seconds=120,
-
-    # Default per-execute() timeout in seconds
-    default_exec_timeout=1800,
-)
-```
-
-### Connection modes
-
-| Mode | When to use | Required config |
-|------|-------------|-----------------|
-| `tunnel` (default) | Local development, any cluster with `kubectl` available | Nothing extra |
-| `gateway` | Production with a Kubernetes Gateway resource | `gateway_name` |
-| `direct` | In-cluster agents or custom sandbox-router URL | `api_url` |
-
----
-
-## Optional: Warm Pools
-
-`SandboxWarmPool` pre-warms a pool of sandbox Pods so they're ready before any agent requests one. This eliminates cold-start latency (container pull + init time).
-
-```yaml
-# examples/k8s/warm-pool.yaml
-apiVersion: extensions.agents.x-k8s.io/v1alpha1
-kind: SandboxWarmPool
-metadata:
-  name: python-warm-pool
-  namespace: default
-spec:
-  templateRef:
-    name: python-sandbox-template
-  size: 3  # keep 3 Pods warm at all times
-```
-
-Apply:
-
-```bash
-kubectl apply -f examples/k8s/warm-pool.yaml
-```
-
-The agent-sandbox controller automatically maintains the pool. When a sandbox is claimed from the pool, a new replacement Pod is started to restore the pool size.
 
 ---
 
@@ -249,12 +364,12 @@ The agent-sandbox controller automatically maintains the pool. When a sandbox is
 ```python
 # Create
 sandbox = provider.get_or_create()
-print(sandbox.id)  # e.g. "python-sandbox-template-a1b2c3d4"
+print(sandbox.id)  # e.g. "python-sandbox-template-a1b2c3d4" or "a1b2c3d4"
 
 # Reconnect to an existing sandbox (within the same provider instance)
-sandbox = provider.get_or_create(sandbox_id="python-sandbox-template-a1b2c3d4")
+sandbox = provider.get_or_create(sandbox_id="a1b2c3d4")
 
-# List active sandboxes (current provider instance)
+# List active sandboxes (current provider instance only)
 sandboxes = provider.list()
 
 # Delete (idempotent)
@@ -329,10 +444,16 @@ asyncio.run(main())
 
 ## Troubleshooting
 
-### `ImportError: k8s-agent-sandbox package not installed`
+### `ImportError: ... requires the 'k8s-agent-sandbox' package`
 
 ```bash
-pip install k8s-agent-sandbox
+pip install langchain-kubernetes[agent-sandbox]
+```
+
+### `ImportError: ... requires the 'kubernetes' package`
+
+```bash
+pip install langchain-kubernetes[raw]
 ```
 
 ### `SandboxTemplate 'my-template' not found in namespace 'default'`
@@ -341,62 +462,73 @@ Create the template first:
 
 ```bash
 kubectl apply -f examples/k8s/sandbox-template.yaml
-# or check existing templates:
+# or list existing templates:
 kubectl get sandboxtemplates
 ```
 
-### `Cannot reach the sandbox-router`
+### `Cannot reach the sandbox-router` (agent-sandbox mode)
 
-**Tunnel mode:** Ensure `kubectl` is in your `$PATH` and the sandbox-router Service exists:
+**Tunnel mode:** Ensure `kubectl` is in `$PATH` and the sandbox-router Service exists:
+
 ```bash
 kubectl get svc -l app=sandbox-router
 ```
 
-**Gateway mode:** Verify the Gateway resource and its external IP:
+**Gateway mode:** Verify the Gateway resource:
+
 ```bash
 kubectl get gateway my-gateway
 ```
 
-**Direct mode:** Verify the `api_url` is reachable from your client.
+**Direct mode:** Verify `api_url` is reachable from your client.
 
-### Sandbox startup timeout
+### Sandbox startup timeout (agent-sandbox mode)
 
-Check the agent-sandbox controller logs:
 ```bash
 kubectl logs -n agent-sandbox-system -l app=agent-sandbox-controller
-```
-
-Check the Sandbox CR status:
-```bash
 kubectl get sandboxes -n default
 kubectl describe sandbox <sandbox-name>
 ```
 
-Increase `startup_timeout_seconds` in your config if the cluster is slow.
+Increase `startup_timeout_seconds` if the cluster is slow.
 
-### Controller or CRDs not installed
+### Pod not reaching Running phase (raw mode)
 
-Run the installation commands from the Prerequisites section above. Verify:
+```bash
+kubectl get pods -n default -l app.kubernetes.io/managed-by=deepagents
+kubectl describe pod deepagents-<sandbox-id> -n default
+kubectl get events -n default --sort-by='.lastTimestamp'
+```
+
+Common causes: image pull failures, insufficient resources, PodSecurityPolicy/OPA admission rejections.
+
+### Controller or CRDs not installed (agent-sandbox mode)
+
 ```bash
 kubectl get crds | grep agents.x-k8s.io
 kubectl get pods -n agent-sandbox-system
 ```
+
+Run the installation commands from the Prerequisites section above, or switch to `mode="raw"`.
 
 ---
 
 ## Development
 
 ```bash
-# Install with dev dependencies
+# Install with dev dependencies (both modes)
 uv venv .venv
-uv pip install -e ".[dev]"
+uv pip install -e ".[all,dev]"
 
 # Run unit tests (no cluster required)
 .venv/bin/python -m pytest tests/unit/
 
-# Run integration tests (requires cluster with agent-sandbox installed)
+# Run agent-sandbox integration tests (requires cluster with controller)
 K8S_INTEGRATION=1 SANDBOX_TEMPLATE=python-sandbox-template \
-  .venv/bin/python -m pytest tests/integration/ -m integration
+  .venv/bin/python -m pytest tests/integration/ -m agent_sandbox
+
+# Run raw mode integration tests (requires any plain Kubernetes cluster)
+.venv/bin/python -m pytest tests/integration/ -m raw_k8s
 ```
 
 ---

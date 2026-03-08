@@ -26,7 +26,13 @@ packages = [{ include = "langchain_kubernetes" }]
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
 deepagents = ">=0.4.3"
-k8s-agent-sandbox = ">=0.1.0"
+k8s-agent-sandbox = {version = ">=0.1.0", optional = true}
+kubernetes = {version = ">=31.0.0", optional = true}
+
+[tool.poetry.extras]
+agent-sandbox = ["k8s-agent-sandbox"]
+raw = ["kubernetes"]
+all = ["k8s-agent-sandbox", "kubernetes"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0"
@@ -37,6 +43,8 @@ pytest-mock = ">=3.0"
 asyncio_mode = "auto"
 markers = [
     "integration: marks tests as integration tests requiring a live cluster (deselect with '-m not integration')",
+    "agent_sandbox: marks tests requiring the agent-sandbox controller (deselect with '-m not agent_sandbox')",
+    "raw_k8s: marks tests requiring a plain Kubernetes cluster (deselect with '-m not raw_k8s')",
 ]
 
 [tool.ruff]

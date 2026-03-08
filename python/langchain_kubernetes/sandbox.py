@@ -1,8 +1,7 @@
-"""KubernetesSandbox: a BaseSandbox backed by kubernetes-sigs/agent-sandbox."""
+"""KubernetesSandbox: a BaseSandbox backed by a KubernetesBackendProtocol."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -13,35 +12,42 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 
-from langchain_kubernetes._utils import map_execution_result
-
 if TYPE_CHECKING:
-    from k8s_agent_sandbox import SandboxClient
+    from langchain_kubernetes.backends.protocol import KubernetesBackendProtocol
 
 logger = logging.getLogger(__name__)
 
 
 class KubernetesSandbox(BaseSandbox):
-    """A DeepAgents sandbox backed by ``kubernetes-sigs/agent-sandbox``.
+    """A DeepAgents sandbox backed by a Kubernetes execution environment.
 
-    The underlying ``SandboxClient`` context must already be entered (sandbox
-    provisioned and ready) before this object is constructed. Use
-    :class:`~langchain_kubernetes.provider.KubernetesProvider` to manage the
-    full lifecycle.
+    Delegates all operations to a
+    :class:`~langchain_kubernetes.backends.protocol.KubernetesBackendProtocol`
+    implementation — either
+    :class:`~langchain_kubernetes.backends.agent_sandbox.AgentSandboxBackend`
+    (when ``mode="agent-sandbox"``) or
+    :class:`~langchain_kubernetes.backends.raw.RawK8sBackend`
+    (when ``mode="raw"``).
+
+    The sandbox does not know which mode is active. Use
+    :class:`~langchain_kubernetes.provider.KubernetesProvider` to create
+    instances with the right backend.
 
     All filesystem helper methods (``read``, ``write``, ``edit``, ``ls_info``,
     ``glob_info``, ``grep_raw``) are inherited from
     :class:`~deepagents.backends.sandbox.BaseSandbox` — they work by
     constructing shell commands and calling :meth:`execute`.
 
+    File upload and download first try the backend's native transfer mechanism.
+    If the backend raises, they fall back to the
+    :class:`~deepagents.backends.sandbox.BaseSandbox` base64-via-execute path.
+
     Args:
-        client: An *entered* ``SandboxClient`` instance (context already active).
-        sandbox_name: The Kubernetes Sandbox CR name (``client.sandbox_name``).
+        backend: An active backend instance.
     """
 
-    def __init__(self, *, client: "SandboxClient", sandbox_name: str) -> None:
-        self._client = client
-        self._sandbox_name = sandbox_name
+    def __init__(self, *, backend: "KubernetesBackendProtocol") -> None:
+        self._backend = backend
 
     # ------------------------------------------------------------------
     # BaseSandbox: id
@@ -49,12 +55,13 @@ class KubernetesSandbox(BaseSandbox):
 
     @property
     def id(self) -> str:
-        """Unique sandbox identifier — the Kubernetes Sandbox CR name.
+        """Unique sandbox identifier delegated to the backend.
 
         Returns:
-            The Sandbox CR name, e.g. ``"my-template-a1b2c3d4"``.
+            Sandbox ID string (Sandbox CR name for agent-sandbox mode,
+            short hex ID for raw mode).
         """
-        return self._sandbox_name
+        return self._backend.id
 
     # ------------------------------------------------------------------
     # BaseSandbox: execute (sync)
@@ -64,18 +71,13 @@ class KubernetesSandbox(BaseSandbox):
         """Execute *command* inside the sandbox and return the result.
 
         Args:
-            command: Shell command string to run (executed by the sandbox runtime).
-            timeout: Per-call timeout in seconds. Falls back to
-                the provider's ``default_exec_timeout`` when ``None``.
+            command: Shell command string.
+            timeout: Per-call timeout in seconds.
 
         Returns:
-            :class:`~deepagents.backends.protocol.ExecuteResponse` with combined
-            stdout/stderr, the process exit code, and ``truncated=False``.
+            :class:`~deepagents.backends.protocol.ExecuteResponse`.
         """
-        effective_timeout = timeout if timeout is not None else 60 * 30
-        logger.debug("exec [%s] %s", self._sandbox_name, command[:120])
-        result = self._client.run(command, timeout=effective_timeout)
-        return map_execution_result(result)
+        return self._backend.execute(command, timeout=timeout)
 
     # ------------------------------------------------------------------
     # BaseSandbox: execute (async)
@@ -84,27 +86,26 @@ class KubernetesSandbox(BaseSandbox):
     async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """Async variant of :meth:`execute`.
 
-        Runs the synchronous ``SandboxClient.run()`` in a thread pool so the
-        event loop is not blocked.
-
         Args:
             command: Shell command string.
-            timeout: Per-call timeout override in seconds.
+            timeout: Per-call timeout in seconds.
 
         Returns:
             :class:`~deepagents.backends.protocol.ExecuteResponse`.
         """
-        return await asyncio.to_thread(self.execute, command, timeout=timeout)
+        return await self._backend.aexecute(command, timeout=timeout)
 
     # ------------------------------------------------------------------
     # BaseSandbox: file transfer
     # ------------------------------------------------------------------
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        """Upload files to the sandbox via ``SandboxClient.write()``.
+        """Upload files, falling back to BaseSandbox base64-via-execute on error.
 
-        Falls back to the :class:`~deepagents.backends.sandbox.BaseSandbox`
-        base64-via-execute path for individual files that fail.
+        Tries the backend's native upload mechanism first. If the backend raises
+        an exception, falls back to
+        :meth:`~deepagents.backends.sandbox.BaseSandbox.upload_files` which
+        encodes each file as base64 and transfers it via :meth:`execute`.
 
         Args:
             files: List of ``(absolute_path, content_bytes)`` tuples.
@@ -112,24 +113,20 @@ class KubernetesSandbox(BaseSandbox):
         Returns:
             List of :class:`~deepagents.backends.protocol.FileUploadResponse`.
         """
-        responses: list[FileUploadResponse] = []
-        for path, content in files:
-            try:
-                self._client.write(path, content)
-                responses.append(FileUploadResponse(path=path, error=None))
-                logger.debug("uploaded %s to sandbox %s", path, self._sandbox_name)
-            except Exception as exc:
-                logger.warning("SDK write failed for %s (%s), falling back to execute", path, exc)
-                # Fall back to BaseSandbox base64-via-execute for this file
-                fallback = super().upload_files([(path, content)])
-                responses.extend(fallback)
-        return responses
+        try:
+            return self._backend.upload_files(files)
+        except Exception as exc:
+            logger.warning(
+                "Backend upload failed (%s), falling back to base64-via-execute", exc
+            )
+            return super().upload_files(files)
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-        """Download files from the sandbox via ``SandboxClient.read()``.
+        """Download files, falling back to BaseSandbox base64-via-execute on error.
 
-        Falls back to the :class:`~deepagents.backends.sandbox.BaseSandbox`
-        base64-via-execute path for individual files that fail.
+        Tries the backend's native download mechanism first. If the backend
+        raises, falls back to
+        :meth:`~deepagents.backends.sandbox.BaseSandbox.download_files`.
 
         Args:
             paths: Absolute paths to download from the sandbox.
@@ -137,14 +134,10 @@ class KubernetesSandbox(BaseSandbox):
         Returns:
             List of :class:`~deepagents.backends.protocol.FileDownloadResponse`.
         """
-        responses: list[FileDownloadResponse] = []
-        for path in paths:
-            try:
-                content: bytes = self._client.read(path)
-                responses.append(FileDownloadResponse(path=path, content=content, error=None))
-                logger.debug("downloaded %s from sandbox %s", path, self._sandbox_name)
-            except Exception as exc:
-                logger.warning("SDK read failed for %s (%s), falling back to execute", path, exc)
-                fallback = super().download_files([path])
-                responses.extend(fallback)
-        return responses
+        try:
+            return self._backend.download_files(paths)
+        except Exception as exc:
+            logger.warning(
+                "Backend download failed (%s), falling back to base64-via-execute", exc
+            )
+            return super().download_files(paths)
