@@ -1,7 +1,8 @@
-"""KubernetesSandbox: a BaseSandbox backed by an ephemeral Kubernetes Pod."""
+"""KubernetesSandbox: a BaseSandbox backed by kubernetes-sigs/agent-sandbox."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 
@@ -12,100 +13,69 @@ from deepagents.backends.protocol import (
 )
 from deepagents.backends.sandbox import BaseSandbox
 
-from langchain_kubernetes.exec_transport import (
-    download_files_tar,
-    exec_command,
-    upload_files_tar,
-)
+from langchain_kubernetes._utils import map_execution_result
 
 if TYPE_CHECKING:
-    import kubernetes.client
-
-    from langchain_kubernetes.config import KubernetesProviderConfig
+    from k8s_agent_sandbox import SandboxClient
 
 logger = logging.getLogger(__name__)
 
 
 class KubernetesSandbox(BaseSandbox):
-    """A sandbox backed by a running Kubernetes Pod.
+    """A DeepAgents sandbox backed by ``kubernetes-sigs/agent-sandbox``.
 
-    The Pod must already exist and be in the ``Running`` phase before this
-    object is constructed.  Use
-    :class:`~langchain_kubernetes.provider.KubernetesProvider` to create and
-    manage the Pod lifecycle.
+    The underlying ``SandboxClient`` context must already be entered (sandbox
+    provisioned and ready) before this object is constructed. Use
+    :class:`~langchain_kubernetes.provider.KubernetesProvider` to manage the
+    full lifecycle.
 
-    All file-system operations (``read``, ``write``, ``edit``, ``ls_info``,
+    All filesystem helper methods (``read``, ``write``, ``edit``, ``ls_info``,
     ``glob_info``, ``grep_raw``) are inherited from
-    :class:`~deepagents.backends.sandbox.BaseSandbox` and are implemented by
-    constructing shell commands and delegating to :meth:`execute`.
+    :class:`~deepagents.backends.sandbox.BaseSandbox` — they work by
+    constructing shell commands and calling :meth:`execute`.
 
     Args:
-        pod_name: Name of the running Pod.
-        namespace: Kubernetes namespace that contains the Pod.
-        container: Name of the container inside the Pod.
-        core_v1: Authenticated ``kubernetes.client.CoreV1Api`` instance.
-        config: Provider configuration (used for default exec timeout).
+        client: An *entered* ``SandboxClient`` instance (context already active).
+        sandbox_name: The Kubernetes Sandbox CR name (``client.sandbox_name``).
     """
 
-    def __init__(
-        self,
-        *,
-        pod_name: str,
-        namespace: str,
-        container: str,
-        core_v1: "kubernetes.client.CoreV1Api",
-        config: "KubernetesProviderConfig",
-    ) -> None:
-        self._pod_name = pod_name
-        self._namespace = namespace
-        self._container = container
-        self._core_v1 = core_v1
-        self._config = config
+    def __init__(self, *, client: "SandboxClient", sandbox_name: str) -> None:
+        self._client = client
+        self._sandbox_name = sandbox_name
 
     # ------------------------------------------------------------------
-    # SandboxBackendProtocol: id
+    # BaseSandbox: id
     # ------------------------------------------------------------------
 
     @property
     def id(self) -> str:
-        """Unique sandbox identifier.
+        """Unique sandbox identifier — the Kubernetes Sandbox CR name.
 
         Returns:
-            ``"{namespace}/{pod_name}"`` when namespace-per-sandbox mode is
-            active, otherwise just ``pod_name``.
+            The Sandbox CR name, e.g. ``"my-template-a1b2c3d4"``.
         """
-        if self._config.namespace_per_sandbox:
-            return f"{self._namespace}/{self._pod_name}"
-        return self._pod_name
+        return self._sandbox_name
 
     # ------------------------------------------------------------------
     # BaseSandbox: execute (sync)
     # ------------------------------------------------------------------
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
-        """Execute *command* inside the sandbox Pod and return the result.
+        """Execute *command* inside the sandbox and return the result.
 
         Args:
-            command: Shell command string to run via ``/bin/sh -c``.
-            timeout: Override the default exec timeout (seconds).  When
-                ``None`` the :attr:`~langchain_kubernetes.config.KubernetesProviderConfig.default_exec_timeout`
-                from the provider config is used.
+            command: Shell command string to run (executed by the sandbox runtime).
+            timeout: Per-call timeout in seconds. Falls back to
+                the provider's ``default_exec_timeout`` when ``None``.
 
         Returns:
-            :class:`~deepagents.backends.protocol.ExecuteResponse` with
-            combined stdout/stderr, the process exit code, and
-            ``truncated=False``.
+            :class:`~deepagents.backends.protocol.ExecuteResponse` with combined
+            stdout/stderr, the process exit code, and ``truncated=False``.
         """
-        effective_timeout = timeout if timeout is not None else self._config.default_exec_timeout
-        logger.debug("exec [%s/%s] %s", self._namespace, self._pod_name, command[:120])
-        return exec_command(
-            self._core_v1,
-            pod_name=self._pod_name,
-            namespace=self._namespace,
-            container=self._container,
-            command=command,
-            timeout=effective_timeout,
-        )
+        effective_timeout = timeout if timeout is not None else 60 * 30
+        logger.debug("exec [%s] %s", self._sandbox_name, command[:120])
+        result = self._client.run(command, timeout=effective_timeout)
+        return map_execution_result(result)
 
     # ------------------------------------------------------------------
     # BaseSandbox: execute (async)
@@ -114,61 +84,27 @@ class KubernetesSandbox(BaseSandbox):
     async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """Async variant of :meth:`execute`.
 
-        Requires ``kubernetes_asyncio`` (``pip install 'langchain-kubernetes[async]'``).
+        Runs the synchronous ``SandboxClient.run()`` in a thread pool so the
+        event loop is not blocked.
 
         Args:
             command: Shell command string.
-            timeout: Per-call timeout override (seconds).
+            timeout: Per-call timeout override in seconds.
 
         Returns:
             :class:`~deepagents.backends.protocol.ExecuteResponse`.
         """
-        from langchain_kubernetes.exec_transport import async_exec_command
-
-        try:
-            from kubernetes_asyncio import client as async_k8s_client
-            from kubernetes_asyncio import config as async_k8s_config
-        except ImportError as exc:
-            raise ImportError(
-                "kubernetes_asyncio is required for async exec. "
-                "Install it with: pip install 'langchain-kubernetes[async]'"
-            ) from exc
-
-        effective_timeout = timeout if timeout is not None else self._config.default_exec_timeout
-
-        # Build an async CoreV1Api using the same kubeconfig context as the
-        # sync client (load config then create client).
-        if self._config.kubeconfig:
-            await async_k8s_config.load_kube_config(
-                config_file=self._config.kubeconfig,
-                context=self._config.context,
-            )
-        else:
-            try:
-                async_k8s_config.load_incluster_config()
-            except Exception:
-                await async_k8s_config.load_kube_config(context=self._config.context)
-
-        async with async_k8s_client.ApiClient() as api_client:
-            core_v1_async = async_k8s_client.CoreV1Api(api_client)
-            return await async_exec_command(
-                core_v1_async,
-                pod_name=self._pod_name,
-                namespace=self._namespace,
-                container=self._container,
-                command=command,
-                timeout=effective_timeout,
-            )
+        return await asyncio.to_thread(self.execute, command, timeout=timeout)
 
     # ------------------------------------------------------------------
-    # BaseSandbox: file transfer (override with tar-based implementation)
+    # BaseSandbox: file transfer
     # ------------------------------------------------------------------
 
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        """Upload files to the sandbox Pod via a tar-piped exec.
+        """Upload files to the sandbox via ``SandboxClient.write()``.
 
         Falls back to the :class:`~deepagents.backends.sandbox.BaseSandbox`
-        base64-via-execute path on error.
+        base64-via-execute path for individual files that fail.
 
         Args:
             files: List of ``(absolute_path, content_bytes)`` tuples.
@@ -176,38 +112,39 @@ class KubernetesSandbox(BaseSandbox):
         Returns:
             List of :class:`~deepagents.backends.protocol.FileUploadResponse`.
         """
-        try:
-            return upload_files_tar(
-                self._core_v1,
-                pod_name=self._pod_name,
-                namespace=self._namespace,
-                container=self._container,
-                files=files,
-            )
-        except Exception as exc:
-            logger.warning("tar upload failed (%s), falling back to base64 path", exc)
-            return super().upload_files(files)
+        responses: list[FileUploadResponse] = []
+        for path, content in files:
+            try:
+                self._client.write(path, content)
+                responses.append(FileUploadResponse(path=path, error=None))
+                logger.debug("uploaded %s to sandbox %s", path, self._sandbox_name)
+            except Exception as exc:
+                logger.warning("SDK write failed for %s (%s), falling back to execute", path, exc)
+                # Fall back to BaseSandbox base64-via-execute for this file
+                fallback = super().upload_files([(path, content)])
+                responses.extend(fallback)
+        return responses
 
     def download_files(self, paths: list[str]) -> list[FileDownloadResponse]:
-        """Download files from the sandbox Pod via a tar-streamed exec.
+        """Download files from the sandbox via ``SandboxClient.read()``.
 
         Falls back to the :class:`~deepagents.backends.sandbox.BaseSandbox`
-        base64-via-execute path on error.
+        base64-via-execute path for individual files that fail.
 
         Args:
-            paths: Absolute paths to download from the Pod.
+            paths: Absolute paths to download from the sandbox.
 
         Returns:
             List of :class:`~deepagents.backends.protocol.FileDownloadResponse`.
         """
-        try:
-            return download_files_tar(
-                self._core_v1,
-                pod_name=self._pod_name,
-                namespace=self._namespace,
-                container=self._container,
-                paths=paths,
-            )
-        except Exception as exc:
-            logger.warning("tar download failed (%s), falling back to base64 path", exc)
-            return super().download_files(paths)
+        responses: list[FileDownloadResponse] = []
+        for path in paths:
+            try:
+                content: bytes = self._client.read(path)
+                responses.append(FileDownloadResponse(path=path, content=content, error=None))
+                logger.debug("downloaded %s from sandbox %s", path, self._sandbox_name)
+            except Exception as exc:
+                logger.warning("SDK read failed for %s (%s), falling back to execute", path, exc)
+                fallback = super().download_files([path])
+                responses.extend(fallback)
+        return responses

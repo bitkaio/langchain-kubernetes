@@ -2,67 +2,44 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
 class KubernetesProviderConfig:
     """Configuration for :class:`~langchain_kubernetes.provider.KubernetesProvider`.
 
+    Pod-level configuration (image, resources, securityContext, runtimeClassName,
+    network policies) is defined in ``SandboxTemplate`` CRDs — not here. This config
+    only contains connection and template-selection parameters.
+
     Attributes:
-        namespace: Default namespace where sandbox Pods are created when
-            ``namespace_per_sandbox`` is ``False``.
-        namespace_per_sandbox: When ``True``, each sandbox is isolated in its
-            own Kubernetes namespace.  The sandbox ID becomes
-            ``"{namespace}/{pod-name}"``.  When ``False`` (default), all Pods
-            share ``namespace``.
-        image: Container image for the sandbox Pod.
-        image_pull_policy: Kubernetes ``imagePullPolicy`` for the sandbox
-            container.  Valid values: ``"Always"``, ``"IfNotPresent"``,
-            ``"Never"``.
-        container_name: Name of the container inside the Pod.
-        block_network: When ``True`` (default), attach a deny-all
-            ``NetworkPolicy`` to every sandbox Pod.
-        cpu_request: Kubernetes CPU resource *request* for the sandbox
-            container (e.g. ``"100m"``).
-        cpu_limit: Kubernetes CPU resource *limit* (e.g. ``"2"``).
-        memory_request: Kubernetes memory resource *request* (e.g. ``"128Mi"``).
-        memory_limit: Kubernetes memory resource *limit* (e.g. ``"512Mi"``).
-        startup_timeout: Seconds to wait for the Pod to become ``Running``
-            before raising and cleaning up.
-        default_exec_timeout: Default timeout in seconds for individual
-            ``execute()`` calls when no per-call timeout is supplied.
-            ``None`` means wait indefinitely.
-        kubeconfig: Path to the kubeconfig file.  ``None`` uses the in-cluster
-            service-account credentials or the default ``~/.kube/config``.
-        context: Kubernetes context name to use from the kubeconfig.  ``None``
-            uses the active context.
-        run_as_user: UID the sandbox container runs as.  ``None`` omits the
-            field and lets the cluster assign a UID — required for OpenShift,
-            which enforces a namespace-allocated UID range via SCC.
-        run_as_group: GID the sandbox container runs as.  ``None`` omits the
-            field, same rationale as ``run_as_user``.
-        seccomp_profile: seccompProfile type applied to the container (e.g.
-            ``"RuntimeDefault"``).  Set to ``None`` to omit the field entirely,
-            which is necessary for OpenShift < 4.11 where the field is not
-            supported.
+        template_name: Name of the ``SandboxTemplate`` CR to use. Must already exist
+            in the cluster. Required.
+        namespace: Kubernetes namespace where sandboxes are created.
+        connection_mode: How to connect to the sandbox-router.
+
+            - ``"tunnel"`` — auto port-forward via kubectl (default, good for local dev).
+            - ``"gateway"`` — route through a Kubernetes Gateway resource.
+            - ``"direct"`` — connect to an explicit URL (for in-cluster or custom domains).
+        gateway_name: Name of the Gateway resource. Only used when
+            ``connection_mode="gateway"``.
+        gateway_namespace: Namespace of the Gateway resource. Defaults to ``namespace``.
+        api_url: Full URL of the sandbox-router. Only used when
+            ``connection_mode="direct"``.
+        server_port: Port that the sandbox runtime listens on.
+        startup_timeout_seconds: Seconds to wait for a sandbox to become ready before
+            raising a :class:`TimeoutError`.
+        default_exec_timeout: Default timeout (seconds) for individual ``execute()``
+            calls when no per-call timeout is given.
     """
 
-    namespace: str = "deepagents-sandboxes"
-    namespace_per_sandbox: bool = False
-    image: str = "python:3.12-slim"
-    image_pull_policy: str = "IfNotPresent"
-    container_name: str = "sandbox"
-    block_network: bool = True
-    cpu_request: str | None = "100m"
-    cpu_limit: str | None = "2"
-    memory_request: str | None = "128Mi"
-    memory_limit: str | None = "512Mi"
-    startup_timeout: float = 120.0
-    default_exec_timeout: int | None = 30 * 60  # 30 minutes
-    kubeconfig: str | None = None
-    context: str | None = None
-    extra_env: dict[str, str] = field(default_factory=dict)
-    run_as_user: int | None = 1000
-    run_as_group: int | None = 1000
-    seccomp_profile: str | None = "RuntimeDefault"
+    template_name: str
+    namespace: str = "default"
+    connection_mode: str = "tunnel"
+    gateway_name: str | None = None
+    gateway_namespace: str = "default"
+    api_url: str | None = None
+    server_port: int = 8888
+    startup_timeout_seconds: int = 120
+    default_exec_timeout: int = 60 * 30  # 30 minutes

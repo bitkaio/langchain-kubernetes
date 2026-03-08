@@ -1,71 +1,69 @@
-"""Pytest fixtures for integration tests against a kind cluster."""
+"""Integration test fixtures.
+
+Requires a kind cluster with the agent-sandbox controller, CRDs, and
+sandbox-router installed. Apply a SandboxTemplate before running:
+
+    kubectl apply -f examples/k8s/sandbox-template.yaml
+
+Run integration tests with:
+
+    K8S_INTEGRATION=1 pytest -m integration
+
+Environment variables:
+    K8S_INTEGRATION     Set to any non-empty value to enable integration tests.
+    SANDBOX_TEMPLATE    SandboxTemplate name (default: "python-sandbox-template").
+    SANDBOX_NAMESPACE   Kubernetes namespace (default: "default").
+    SANDBOX_TIMEOUT     Startup timeout in seconds (default: 180).
+"""
 
 from __future__ import annotations
 
-import uuid
-import pytest
-import kubernetes.client as k8s_client
-import kubernetes.config as k8s_config
+import os
 
-from langchain_kubernetes.config import KubernetesProviderConfig
-from langchain_kubernetes.provider import KubernetesProvider
+import pytest
 
 
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
-        "integration: mark test as integration test requiring a live Kubernetes cluster",
+        "integration: marks tests as integration tests requiring a live cluster "
+        "(deselect with '-m not integration')",
     )
 
 
-@pytest.fixture(scope="session")
-def k8s_core_v1():
-    """Session-scoped CoreV1Api pointing at the default kubeconfig context."""
-    k8s_config.load_kube_config()
-    return k8s_client.CoreV1Api()
+def pytest_collection_modifyitems(config, items):
+    if os.environ.get("K8S_INTEGRATION"):
+        return  # run everything
 
-
-@pytest.fixture(scope="session")
-def test_namespace(k8s_core_v1):
-    """Create a dedicated test namespace and delete it on teardown."""
-    ns_name = f"deepagents-test-{uuid.uuid4().hex[:8]}"
-    body = k8s_client.V1Namespace(
-        metadata=k8s_client.V1ObjectMeta(
-            name=ns_name,
-            labels={"app.kubernetes.io/managed-by": "deepagents-test"},
-        )
+    skip_integration = pytest.mark.skip(
+        reason="Set K8S_INTEGRATION=1 to run integration tests"
     )
-    k8s_core_v1.create_namespace(body)
-    yield ns_name
-    try:
-        k8s_core_v1.delete_namespace(
-            ns_name,
-            body=k8s_client.V1DeleteOptions(propagation_policy="Foreground"),
-        )
-    except Exception:
-        pass
+    for item in items:
+        if item.get_closest_marker("integration"):
+            item.add_marker(skip_integration)
 
 
-@pytest.fixture()
-def provider(test_namespace):
-    """KubernetesProvider configured to use the test namespace."""
-    config = KubernetesProviderConfig(
-        namespace=test_namespace,
-        namespace_per_sandbox=False,
-        block_network=True,
-        startup_timeout=120,
-        image="python:3.12-slim",
+SANDBOX_TEMPLATE = os.environ.get("SANDBOX_TEMPLATE", "python-sandbox-template")
+SANDBOX_NAMESPACE = os.environ.get("SANDBOX_NAMESPACE", "default")
+SANDBOX_TIMEOUT = int(os.environ.get("SANDBOX_TIMEOUT", "180"))
+
+
+@pytest.fixture
+def provider_config():
+    """KubernetesProviderConfig for integration tests (tunnel mode)."""
+    from langchain_kubernetes.config import KubernetesProviderConfig
+
+    return KubernetesProviderConfig(
+        template_name=SANDBOX_TEMPLATE,
+        namespace=SANDBOX_NAMESPACE,
+        connection_mode="tunnel",
+        startup_timeout_seconds=SANDBOX_TIMEOUT,
     )
-    return KubernetesProvider(config=config)
 
 
-@pytest.fixture()
-def provider_ns_per_sandbox():
-    """KubernetesProvider using one namespace per sandbox."""
-    config = KubernetesProviderConfig(
-        namespace_per_sandbox=True,
-        block_network=True,
-        startup_timeout=120,
-        image="python:3.12-slim",
-    )
-    return KubernetesProvider(config=config)
+@pytest.fixture
+def provider(provider_config):
+    """KubernetesProvider for integration tests."""
+    from langchain_kubernetes.provider import KubernetesProvider
+
+    return KubernetesProvider(provider_config)

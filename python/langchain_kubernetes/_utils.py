@@ -1,95 +1,42 @@
-"""Utility helpers: label constants, ID generation, polling."""
+"""Minimal helpers: logging and response mapping."""
 
 from __future__ import annotations
 
-import secrets
-import time
-from typing import Callable
+import logging
 
-# Standard Kubernetes labels applied to all managed resources
-LABEL_MANAGED_BY = "app.kubernetes.io/managed-by"
-LABEL_COMPONENT = "app.kubernetes.io/component"
-LABEL_SANDBOX_ID = "deepagents.langchain.com/sandbox-id"
-
-MANAGED_BY_VALUE = "deepagents"
-COMPONENT_VALUE = "sandbox"
-
-# Label selector used when listing all deepagents sandboxes
-MANAGED_BY_SELECTOR = f"{LABEL_MANAGED_BY}={MANAGED_BY_VALUE},{LABEL_COMPONENT}={COMPONENT_VALUE}"
+from deepagents.backends.protocol import ExecuteResponse
 
 
-def make_sandbox_id() -> str:
-    """Generate a short random hex ID for a new sandbox.
-
-    Returns:
-        Eight-character lowercase hex string, e.g. ``"a1b2c3d4"``.
-    """
-    return secrets.token_hex(4)
-
-
-def make_pod_name(sandbox_id: str) -> str:
-    """Build the Pod name from a sandbox ID.
+def map_execution_result(result: object, *, default_timeout: int = 60) -> ExecuteResponse:
+    """Map a ``SandboxClient`` ``ExecutionResult`` to ``ExecuteResponse``.
 
     Args:
-        sandbox_id: Short hex sandbox identifier.
+        result: ``ExecutionResult`` returned by ``SandboxClient.run()``.
+        default_timeout: Unused — kept for call-site compatibility.
 
     Returns:
-        Pod name string, e.g. ``"deepagents-sandbox-a1b2c3d4"``.
+        :class:`~deepagents.backends.protocol.ExecuteResponse` with combined
+        stdout/stderr output, the process exit code, and ``truncated=False``.
     """
-    return f"deepagents-sandbox-{sandbox_id}"
+    stdout: str = getattr(result, "stdout", "") or ""
+    stderr: str = getattr(result, "stderr", "") or ""
+    exit_code: int = getattr(result, "exit_code", -1)
+
+    if stdout and stderr:
+        output = stdout + stderr
+    else:
+        output = stdout or stderr
+
+    return ExecuteResponse(output=output, exit_code=exit_code, truncated=False)
 
 
-def make_namespace_name(sandbox_id: str) -> str:
-    """Build a per-sandbox namespace name.
+def get_logger(name: str) -> logging.Logger:
+    """Return a module-level logger.
 
     Args:
-        sandbox_id: Short hex sandbox identifier.
+        name: Usually ``__name__`` of the calling module.
 
     Returns:
-        Namespace name, e.g. ``"deepagents-sandbox-a1b2c3d4"``.
+        Configured :class:`logging.Logger`.
     """
-    return f"deepagents-sandbox-{sandbox_id}"
-
-
-def common_labels(sandbox_id: str) -> dict[str, str]:
-    """Return the standard label set for a given sandbox ID.
-
-    Args:
-        sandbox_id: Sandbox identifier to embed in labels.
-
-    Returns:
-        Dict of Kubernetes labels.
-    """
-    return {
-        LABEL_MANAGED_BY: MANAGED_BY_VALUE,
-        LABEL_COMPONENT: COMPONENT_VALUE,
-        LABEL_SANDBOX_ID: sandbox_id,
-    }
-
-
-def poll_until(
-    condition: Callable[[], bool],
-    *,
-    timeout: float,
-    interval: float = 2.0,
-    on_timeout: Callable[[], None] | None = None,
-) -> None:
-    """Poll *condition* every *interval* seconds until it returns ``True``.
-
-    Args:
-        condition: Callable returning ``True`` when the desired state is reached.
-        timeout: Maximum number of seconds to wait.
-        interval: Sleep duration between polls (default 2 s).
-        on_timeout: Optional cleanup callable invoked before raising on timeout.
-
-    Raises:
-        TimeoutError: If *condition* never becomes ``True`` within *timeout*.
-    """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if condition():
-            return
-        time.sleep(interval)
-    if on_timeout:
-        on_timeout()
-    raise TimeoutError(f"Timed out after {timeout:.0f}s waiting for condition")
+    return logging.getLogger(name)

@@ -1,0 +1,58 @@
+# Example SandboxTemplate CR for langchain-kubernetes.
+#
+# Apply with: kubectl apply -f examples/k8s/sandbox-template.yaml
+#
+# This creates a Python 3.12 sandbox using gVisor for kernel-level isolation.
+# Adjust image, resources, and runtimeClassName to match your cluster setup.
+#
+# Reference: https://agent-sandbox.sigs.k8s.io/docs/sandbox_template/
+
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: python-sandbox-template
+  namespace: default
+spec:
+  podTemplate:
+    spec:
+      # gVisor provides kernel-level isolation (requires gVisor node setup).
+      # Remove or change to "kata-containers" for Kata Containers.
+      # Omit entirely to use the default container runtime.
+      runtimeClassName: gvisor
+
+      containers:
+        - name: sandbox
+          # Use a Python runtime image that exposes the agent-sandbox HTTP server
+          # on the port below. The official sandbox runtime images are available at:
+          # us-central1-docker.pkg.dev/k8s-staging-images/agent-sandbox/python-runtime-sandbox:latest-main
+          image: python:3.12-slim
+          ports:
+            - containerPort: 8888
+              name: sandbox
+
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8888
+            initialDelaySeconds: 0
+            periodSeconds: 2
+            failureThreshold: 30
+
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8888
+            initialDelaySeconds: 2
+            periodSeconds: 10
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+              ephemeral-storage: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 4Gi
+
+      restartPolicy: OnFailure

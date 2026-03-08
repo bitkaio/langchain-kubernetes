@@ -1,0 +1,28 @@
+# Example SandboxWarmPool CR for langchain-kubernetes.
+#
+# A warm pool pre-creates sandbox Pods so they are immediately available
+# when an agent requests one — eliminating cold-start latency.
+#
+# Apply with: kubectl apply -f examples/k8s/warm-pool.yaml
+#
+# Prerequisites:
+#   - The agent-sandbox extensions CRDs must be installed:
+#       kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.1.0/extensions.yaml
+#   - The referenced SandboxTemplate must exist:
+#       kubectl apply -f examples/k8s/sandbox-template.yaml
+#
+# Reference: https://agent-sandbox.sigs.k8s.io/docs/warm_pool/
+
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxWarmPool
+metadata:
+  name: python-warm-pool
+  namespace: default
+spec:
+  # Reference to the SandboxTemplate that defines the sandbox Pod spec.
+  templateRef:
+    name: python-sandbox-template
+
+  # Number of warm Pods to maintain at all times.
+  # When a Pod is claimed by an agent, a new replacement is started automatically.
+  size: 3
