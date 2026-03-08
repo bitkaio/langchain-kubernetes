@@ -1,31 +1,38 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"
 
-[project]
+[tool.poetry]
 name = "langchain-kubernetes"
 version = "0.1.0"
-description = "Kubernetes sandbox integration for Deep Agents"
-license = { text = "MIT" }
+description = "Kubernetes sandbox provider for the DeepAgents framework"
+authors = ["bitkaio LLC"]
+license = "MIT"
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = [
-    "deepagents>=0.4.3",
-    "k8s-agent-sandbox>=0.1.0",
+homepage = "https://gitlab.com/bitkaio/langchain/kubernetes-sandbox"
+repository = "https://gitlab.com/bitkaio/langchain/kubernetes-sandbox"
+keywords = ["langchain", "deepagents", "kubernetes", "sandbox", "agents"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+packages = [{ include = "langchain_kubernetes" }]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
-    "pytest-mock>=3.0",
-]
+[tool.poetry.dependencies]
+python = ">=3.10,<4.0"
+deepagents = ">=0.4.3"
+k8s-agent-sandbox = ">=0.1.0"
 
-[project.urls]
-Repository = "https://github.com/langchain-ai/deepagents"
-
-[tool.hatch.build.targets.wheel]
-packages = ["langchain_kubernetes"]
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+pytest-asyncio = ">=0.24"
+pytest-mock = ">=3.0"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
