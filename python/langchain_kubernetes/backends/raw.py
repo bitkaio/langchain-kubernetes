@@ -32,6 +32,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+try:
+    from kubernetes.client.exceptions import ApiException as _ApiException
+except ImportError:
+
+    class _ApiException(Exception):  # type: ignore[assignment]
+        """Fallback stub used when the ``kubernetes`` package is not installed."""
+
+        def __init__(self, status: int = 0, reason: str = "", **kwargs: Any) -> None:
+            self.status = status
+            self.reason = reason
+            super().__init__(f"({status})\nReason: {reason}")
+
 _POD_POLL_INTERVAL = 2  # seconds between phase polls
 
 
@@ -294,15 +306,13 @@ class RawK8sBackend:
             SandboxNotFoundError: If the Pod does not exist.
             RuntimeError: If the Pod is not in ``Running`` phase.
         """
-        from kubernetes.client.exceptions import ApiException
-
         core_v1, networking_v1 = _load_k8s_clients()
         pod_name = f"deepagents-{sandbox_id}"
         namespace = _resolve_namespace(config, sandbox_id)
 
         try:
             pod = core_v1.read_namespaced_pod(name=pod_name, namespace=namespace)
-        except ApiException as exc:
+        except _ApiException as exc:
             if exc.status == 404:
                 raise SandboxNotFoundError(
                     f"Pod '{pod_name}' not found in namespace '{namespace}'. "
@@ -331,37 +341,31 @@ class RawK8sBackend:
     # ------------------------------------------------------------------
 
     def _delete_pod(self) -> None:
-        from kubernetes.client.exceptions import ApiException
-
         try:
             self._core_v1.delete_namespaced_pod(
                 name=self._pod_name, namespace=self._namespace
             )
             logger.debug("Deleted Pod %s", self._pod_name)
-        except ApiException as exc:
+        except _ApiException as exc:
             if exc.status != 404:
                 raise
 
     def _delete_network_policy(self) -> None:
-        from kubernetes.client.exceptions import ApiException
-
         np_name = f"deepagents-deny-all-{self._sandbox_id}"
         try:
             self._networking_v1.delete_namespaced_network_policy(
                 name=np_name, namespace=self._namespace
             )
             logger.debug("Deleted NetworkPolicy %s", np_name)
-        except ApiException as exc:
+        except _ApiException as exc:
             if exc.status != 404:
                 raise
 
     def _delete_namespace(self, namespace: str) -> None:
-        from kubernetes.client.exceptions import ApiException
-
         try:
             self._core_v1.delete_namespace(name=namespace)
             logger.debug("Deleted Namespace %s", namespace)
-        except ApiException as exc:
+        except _ApiException as exc:
             if exc.status != 404:
                 raise
 
@@ -415,25 +419,21 @@ def _resolve_namespace(config: "KubernetesProviderConfig", sandbox_id: str) -> s
 
 
 def _create_namespace(core_v1: Any, name: str) -> None:
-    from kubernetes.client.exceptions import ApiException
-
     manifest = build_namespace_manifest(name)
     try:
         core_v1.create_namespace(body=manifest)
         logger.info("Created Namespace %s", name)
-    except ApiException as exc:
+    except _ApiException as exc:
         if exc.status != 409:  # 409 = already exists
             raise
 
 
 def _create_network_policy(networking_v1: Any, sandbox_id: str, namespace: str) -> None:
-    from kubernetes.client.exceptions import ApiException
-
     manifest = build_network_policy_manifest(sandbox_id, namespace)
     try:
         networking_v1.create_namespaced_network_policy(namespace=namespace, body=manifest)
         logger.debug("Created NetworkPolicy for sandbox %s", sandbox_id)
-    except ApiException as exc:
+    except _ApiException as exc:
         if exc.status == 409:
             logger.debug("NetworkPolicy for %s already exists", sandbox_id)
         else:
@@ -455,8 +455,6 @@ def _wait_for_pod_running(
         TimeoutError: If the Pod does not become Running in time.
         RuntimeError: If the Pod enters a terminal failed state.
     """
-    from kubernetes.client.exceptions import ApiException
-
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -471,7 +469,7 @@ def _wait_for_pod_running(
                 )
             # "Pending" or "ContainerCreating" — keep polling
             logger.debug("Pod %s phase: %s — waiting...", pod_name, phase)
-        except ApiException as exc:
+        except _ApiException as exc:
             if exc.status == 404:
                 logger.debug("Pod %s not yet visible, waiting...", pod_name)
             else:
@@ -489,8 +487,6 @@ def _wait_for_pod_running(
 def _try_delete_pod(core_v1: Any, pod_name: str, namespace: str) -> None:
     """Best-effort Pod deletion — errors are logged and swallowed."""
     try:
-        from kubernetes.client.exceptions import ApiException
-
         core_v1.delete_namespaced_pod(name=pod_name, namespace=namespace)
     except Exception as exc:
         logger.debug("Best-effort Pod cleanup failed for %s: %s", pod_name, exc)

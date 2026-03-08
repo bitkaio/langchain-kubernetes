@@ -236,10 +236,10 @@ class TestRawK8sBackendCleanup:
         )
 
     def test_cleanup_does_not_raise_on_404(self):
-        from kubernetes.client.exceptions import ApiException
+        from langchain_kubernetes.backends.raw import _ApiException
 
         backend = _make_backend()
-        exc = ApiException(status=404)
+        exc = _ApiException(status=404)
         backend._core_v1.delete_namespaced_pod.side_effect = exc
 
         # Should not raise
@@ -277,13 +277,13 @@ class TestRawK8sBackendReconnect:
 
     @patch("langchain_kubernetes.backends.raw._load_k8s_clients")
     def test_reconnect_not_found_raises(self, mock_load):
-        from kubernetes.client.exceptions import ApiException
+        from langchain_kubernetes.backends.raw import _ApiException
 
         core_v1 = MagicMock()
         networking_v1 = MagicMock()
         mock_load.return_value = (core_v1, networking_v1)
 
-        exc = ApiException(status=404)
+        exc = _ApiException(status=404)
         core_v1.read_namespaced_pod.side_effect = exc
 
         with pytest.raises(SandboxNotFoundError, match="abc12345"):
