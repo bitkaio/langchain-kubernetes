@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 
@@ -14,6 +14,10 @@ if TYPE_CHECKING:
     from k8s_agent_sandbox import SandboxClient
 
 logger = logging.getLogger(__name__)
+
+# A callable invoked after each execute() to track last-activity.
+# Signature: () -> None, fire-and-forget style.
+ActivityCallback = Callable[[], None]
 
 
 class AgentSandboxBackend:
@@ -29,9 +33,16 @@ class AgentSandboxBackend:
         sandbox_name: The Kubernetes Sandbox CR name (``client.sandbox_name``).
     """
 
-    def __init__(self, *, client: "SandboxClient", sandbox_name: str) -> None:
+    def __init__(
+        self,
+        *,
+        client: "SandboxClient",
+        sandbox_name: str,
+        activity_callback: ActivityCallback | None = None,
+    ) -> None:
         self._client = client
         self._sandbox_name = sandbox_name
+        self._activity_callback = activity_callback
 
     # ------------------------------------------------------------------
     # Protocol: id
@@ -63,6 +74,11 @@ class AgentSandboxBackend:
         effective_timeout = timeout if timeout is not None else 60 * 30
         logger.debug("exec [%s] %s", self._sandbox_name, command[:120])
         result = self._client.run(command, timeout=effective_timeout)
+        if self._activity_callback is not None:
+            try:
+                self._activity_callback()
+            except Exception as exc:
+                logger.warning("last-activity callback failed for %s: %s", self._sandbox_name, exc)
         return map_execution_result(result)
 
     async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:

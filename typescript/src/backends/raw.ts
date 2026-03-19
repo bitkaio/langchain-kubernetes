@@ -49,10 +49,12 @@ export class RawK8sBackend implements KubernetesBackend {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly kubeConfig: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private readonly coreApi: any;
+  readonly coreApi: any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly networkingApi: any;
   private readonly config: KubernetesProviderConfig;
+  /** When set, execute() patches the Pod's last-activity annotation after each call. */
+  ttlIdleSeconds?: number;
 
   private constructor(
     podName: string,
@@ -65,7 +67,8 @@ export class RawK8sBackend implements KubernetesBackend {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     networkingApi: any,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    transport: any
+    transport: any,
+    ttlIdleSeconds?: number
   ) {
     this.podName = podName;
     this.namespace = namespace;
@@ -74,6 +77,7 @@ export class RawK8sBackend implements KubernetesBackend {
     this.coreApi = coreApi;
     this.networkingApi = networkingApi;
     this.transport = transport;
+    this.ttlIdleSeconds = ttlIdleSeconds;
     this.id = buildSandboxId(
       namespace,
       podName,
@@ -84,10 +88,20 @@ export class RawK8sBackend implements KubernetesBackend {
   /**
    * Create a new sandbox Pod and wait for it to become Running.
    *
-   * @param config - Full resolved provider config.
+   * @param config           - Full resolved provider config.
+   * @param _sandboxId       - Ignored (reserved for future use).
+   * @param extraLabels      - Additional labels to apply to the Pod.
+   * @param extraAnnotations - Additional annotations to apply to the Pod.
+   * @param ttlIdleSeconds   - When set, execute() patches idle-TTL annotation after each call.
    * @throws {MissingDependencyError} When `@kubernetes/client-node` is not installed.
    */
-  static async create(config: KubernetesProviderConfig): Promise<RawK8sBackend> {
+  static async create(
+    config: KubernetesProviderConfig,
+    _sandboxId?: string,
+    extraLabels?: Record<string, string>,
+    extraAnnotations?: Record<string, string>,
+    ttlIdleSeconds?: number
+  ): Promise<RawK8sBackend> {
     const { k8s, tarStream } = await loadRawDependencies();
 
     const kubeConfig = buildKubeConfig(k8s, config);
@@ -116,7 +130,7 @@ export class RawK8sBackend implements KubernetesBackend {
     }
 
     const sandboxId = buildSandboxId(namespace, podName, config.namespacePerSandbox);
-    const podManifest = buildPodManifest(podName, namespace, sandboxId, config);
+    const podManifest = buildPodManifest(podName, namespace, sandboxId, config, extraLabels, extraAnnotations);
 
     try {
       await coreApi.createNamespacedPod({ namespace, body: podManifest });
@@ -141,7 +155,7 @@ export class RawK8sBackend implements KubernetesBackend {
     const execConfig = resolveExecuteConfig(config.execConfig);
     const transport = new ExecTransport(kubeConfig, execConfig);
 
-    return new RawK8sBackend(podName, namespace, config, kubeConfig, coreApi, networkingApi, transport);
+    return new RawK8sBackend(podName, namespace, config, kubeConfig, coreApi, networkingApi, transport, ttlIdleSeconds);
   }
 
   /**
@@ -271,11 +285,27 @@ export class RawK8sBackend implements KubernetesBackend {
       command,
       options?.timeout
     );
+    // Fire-and-forget: update last-activity annotation for idle-TTL tracking
+    if (this.ttlIdleSeconds !== undefined) {
+      this.patchLastActivity().catch((err: unknown) => {
+        console.warn(`[langchain-kubernetes] Failed to update last-activity annotation: ${String(err)}`);
+      });
+    }
     return {
       output: result.output,
       exitCode: result.exitCode,
       truncated: result.truncated,
     };
+  }
+
+  /** Patch the Pod's last-activity annotation with the current timestamp. */
+  private async patchLastActivity(): Promise<void> {
+    const { ANN_LAST_ACTIVITY } = await import("../labels.js");
+    await this.coreApi.patchNamespacedPod({
+      name: this.podName,
+      namespace: this.namespace,
+      body: { metadata: { annotations: { [ANN_LAST_ACTIVITY]: new Date().toISOString() } } },
+    });
   }
 
   /** Upload files using tar-over-exec. */
@@ -326,6 +356,29 @@ export class RawK8sBackend implements KubernetesBackend {
   async cleanup(): Promise<void> {
     await RawK8sBackend.deleteSandbox(this.id, this.config);
   }
+}
+
+// ── Exported helpers ───────────────────────────────────────────────────────────
+
+/**
+ * Load the Kubernetes API clients for raw mode without creating a full backend.
+ * Used by the provider for label-selector queries (thread_id lookup, warm pool, list).
+ *
+ * @param config - Full resolved provider config.
+ * @throws {MissingDependencyError} When `@kubernetes/client-node` is not installed.
+ */
+export async function loadK8sClients(config: KubernetesProviderConfig): Promise<{
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  coreApi: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  networkingApi: any;
+}> {
+  const { k8s } = await loadRawDependencies();
+  const kubeConfig = buildKubeConfig(k8s, config);
+  return {
+    coreApi: kubeConfig.makeApiClient(k8s.CoreV1Api),
+    networkingApi: kubeConfig.makeApiClient(k8s.NetworkingV1Api),
+  };
 }
 
 // ── Private helpers ────────────────────────────────────────────────────────────

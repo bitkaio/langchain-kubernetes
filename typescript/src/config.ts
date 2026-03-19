@@ -161,6 +161,41 @@ export interface KubernetesProviderConfig {
   /** seccompProfile.type for the Pod. Default: "RuntimeDefault" */
   seccompProfile: string;
 
+  // ── Labels and lifecycle ──────────────────────────────────────────────────
+
+  /**
+   * Labels applied to every sandbox created by this provider.
+   * Keys are automatically prefixed with `langchain-kubernetes.bitkaio.com/`.
+   */
+  defaultLabels?: Record<string, string>;
+
+  /**
+   * Default absolute TTL from creation, in seconds.
+   * Per-call overrides on `getOrCreate()` take precedence.
+   */
+  ttlSeconds?: number;
+
+  /**
+   * Default idle TTL from the last `execute()` call, in seconds.
+   * Per-call overrides on `getOrCreate()` take precedence.
+   */
+  ttlIdleSeconds?: number;
+
+  // ── Warm pool (agent-sandbox mode) ────────────────────────────────────────
+
+  /**
+   * Name of a `SandboxWarmPool` resource to claim from (agent-sandbox only).
+   */
+  warmPoolName?: string;
+
+  // ── Warm pool (raw mode) ──────────────────────────────────────────────────
+
+  /**
+   * Number of warm Pods to pre-create (raw mode only).
+   * `0` disables the warm pool.
+   */
+  warmPoolSize?: number;
+
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   /** @deprecated Use startupTimeoutMs instead (kept for raw-mode compat). */

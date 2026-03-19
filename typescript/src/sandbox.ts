@@ -22,11 +22,22 @@ export class KubernetesSandbox extends BaseSandbox {
   readonly id: string;
 
   private readonly backend: KubernetesBackend;
+  private activityCallback?: () => void;
 
   constructor(backend: KubernetesBackend) {
     super();
     this.backend = backend;
     this.id = backend.id;
+  }
+
+  /**
+   * Register a callback invoked (fire-and-forget) after each successful execute().
+   * Used by the provider to update idle-TTL annotations without blocking execution.
+   *
+   * @param cb - Callback function (errors are swallowed).
+   */
+  setActivityCallback(cb: () => void): void {
+    this.activityCallback = cb;
   }
 
   /**
@@ -39,7 +50,15 @@ export class KubernetesSandbox extends BaseSandbox {
     command: string,
     options?: { timeout?: number }
   ): Promise<ExecuteResponse> {
-    return this.backend.execute(command, options);
+    const result = await this.backend.execute(command, options);
+    if (this.activityCallback) {
+      try {
+        this.activityCallback();
+      } catch {
+        // fire-and-forget — swallow errors
+      }
+    }
+    return result;
   }
 
   /**

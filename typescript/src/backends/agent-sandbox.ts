@@ -53,7 +53,11 @@ export class AgentSandboxBackend implements KubernetesBackend {
    * @throws {SandboxStartupTimeoutError}  When the sandbox doesn't become ready.
    * @throws {TemplateNotFoundError}       When the template doesn't exist.
    */
-  static async create(config: KubernetesProviderConfig): Promise<AgentSandboxBackend> {
+  static async create(
+    config: KubernetesProviderConfig,
+    _extraLabels?: Record<string, string>,
+    _extraAnnotations?: Record<string, string>
+  ): Promise<AgentSandboxBackend> {
     const templateName = config.templateName!;
     const client = buildClient(config);
 

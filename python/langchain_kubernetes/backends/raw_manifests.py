@@ -44,7 +44,12 @@ def sandbox_labels(sandbox_id: str) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
-def build_pod_manifest(config: "KubernetesProviderConfig", sandbox_id: str) -> dict:
+def build_pod_manifest(
+    config: "KubernetesProviderConfig",
+    sandbox_id: str,
+    extra_labels: dict[str, str] | None = None,
+    extra_annotations: dict[str, str] | None = None,
+) -> dict:
     """Build a Pod manifest for a raw-mode sandbox.
 
     The Pod runs ``["sleep", "infinity"]`` by default. All work happens through
@@ -61,12 +66,14 @@ def build_pod_manifest(config: "KubernetesProviderConfig", sandbox_id: str) -> d
     Args:
         config: Provider configuration supplying image, resources, and security settings.
         sandbox_id: Unique sandbox identifier (used in labels and Pod name).
+        extra_labels: Additional labels merged onto the Pod metadata.
+        extra_annotations: Additional annotations merged onto the Pod metadata.
 
     Returns:
         Pod manifest dict.
     """
-    labels = sandbox_labels(sandbox_id)
-    annotations = dict(config.extra_annotations)
+    labels = {**sandbox_labels(sandbox_id), **(extra_labels or {})}
+    annotations = {**config.extra_annotations, **(extra_annotations or {})}
 
     container: dict = {
         "name": "sandbox",

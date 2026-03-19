@@ -359,22 +359,153 @@ deepagents --sandbox kubernetes --mode raw
 
 ---
 
-## Sandbox Lifecycle
+## Per-thread sandboxes and lifecycle management
+
+### KubernetesSandboxManager (LangGraph integration)
+
+The easiest way to use `langchain-kubernetes` with LangGraph. Wraps `KubernetesProvider`
+and exposes a `backend_factory` callable that LangGraph passes a `RunnableConfig` to:
 
 ```python
-# Create
+from langchain_kubernetes import KubernetesSandboxManager, KubernetesProviderConfig
+
+manager = KubernetesSandboxManager(
+    KubernetesProviderConfig(
+        template_name="python-sandbox-template",
+    ),
+    ttl_seconds=3600,         # reclaim after 1h regardless of activity
+    ttl_idle_seconds=1800,    # reclaim after 30 min of inactivity
+    default_labels={"project": "my-agent", "env": "prod"},
+)
+
+# LangGraph usage
+agent = create_deep_agent(model=llm, backend=manager.backend_factory)
+
+# Context manager — cleans up all sandboxes on exit
+with KubernetesSandboxManager(config) as manager:
+    agent = create_deep_agent(model=llm, backend=manager.backend_factory)
+    ...
+
+# Async context manager
+async with KubernetesSandboxManager(config) as manager:
+    ...
+
+# Manual shutdown
+manager.shutdown()       # sync
+await manager.ashutdown() # async
+```
+
+**`KubernetesSandboxManager` constructor:**
+
+| Parameter | Type | Default | Description |
+| --------- | ---- | ------- | ----------- |
+| `provider_config` | `KubernetesProviderConfig` | required | Provider configuration |
+| `ttl_seconds` | `int \| None` | `None` | Absolute TTL from creation |
+| `ttl_idle_seconds` | `int \| None` | `None` | Idle TTL from last `execute()` |
+| `default_labels` | `dict \| None` | `None` | Labels applied to every sandbox (auto-prefixed) |
+
+**Methods:**
+
+| Method | Returns | Description |
+| ------ | ------- | ----------- |
+| `backend_factory` | `Callable` | Sync factory for LangGraph |
+| `abackend_factory(config)` | `Coroutine[KubernetesSandbox]` | Async factory |
+| `get_sandbox(thread_id)` | `KubernetesSandbox \| None` | Lookup without creating |
+| `shutdown()` | `None` | Delete all sandboxes, clear cache |
+| `ashutdown()` | `Coroutine` | Async variant |
+
+### Provider — per-thread get_or_create
+
+```python
+# Create new sandbox
 sandbox = provider.get_or_create()
-print(sandbox.id)  # e.g. "python-sandbox-template-a1b2c3d4" or "a1b2c3d4"
 
-# Reconnect to an existing sandbox (within the same provider instance)
-sandbox = provider.get_or_create(sandbox_id="a1b2c3d4")
+# Idempotent — returns existing sandbox for this thread, or creates a new one
+sandbox = provider.get_or_create(
+    thread_id="conv-abc-123",
+    labels={"customer": "acme"},        # auto-prefixed with langchain-kubernetes.bitkaio.com/
+    ttl_seconds=3600,                   # absolute TTL from creation
+    ttl_idle_seconds=600,               # idle TTL from last execute()
+)
 
-# List active sandboxes (current provider instance only)
-sandboxes = provider.list()
+# Reconnect to a specific sandbox by ID (no K8s API call if in-process cache hit)
+sandbox = provider.get_or_create(sandbox_id="existing-id")
+
+# Look up without creating
+sandbox = provider.find_by_thread_id("conv-abc-123")  # None if not found
+
+# List all managed sandboxes from the K8s API
+response = provider.list()                          # SandboxListResponse
+response = provider.list(thread_id="conv-abc-123") # filter by thread
+response = provider.list(status="running")          # filter by status
+response = provider.list(labels={"customer": "acme"})
+for sb in response.sandboxes:
+    print(sb.id, sb.thread_id, sb.status, sb.last_activity)
+next_page = provider.list(cursor=response.cursor)  # pagination
+
+# Operational methods
+result = provider.cleanup()                   # CleanupResult(deleted=[...], kept=N)
+result = provider.cleanup(max_idle_seconds=300)  # override per-sandbox idle TTL
+stats  = provider.stats()                     # ProviderStats(total, running, warm, idle, thread_ids)
+status = provider.pool_status()               # WarmPoolStatus(available, active, total, target)
+
+# Async variants
+sandbox  = await provider.aget_or_create(thread_id="conv-abc-123")
+response = await provider.alist()
+result   = await provider.acleanup()
+stats    = await provider.astats()
 
 # Delete (idempotent)
 provider.delete(sandbox_id=sandbox.id)
+await provider.adelete(sandbox_id=sandbox.id)
 ```
+
+### New configuration options
+
+The following fields were added to `KubernetesProviderConfig` (both modes unless noted):
+
+| Field | Type | Default | Description |
+| ----- | ---- | ------- | ----------- |
+| `default_labels` | `dict[str, str] \| None` | `None` | Labels applied to every sandbox (auto-prefixed with `langchain-kubernetes.bitkaio.com/`) |
+| `ttl_seconds` | `int \| None` | `None` | Default absolute TTL passed to `get_or_create()` |
+| `ttl_idle_seconds` | `int \| None` | `None` | Default idle TTL passed to `get_or_create()` |
+| `warm_pool_size` | `int` | `0` | Number of warm Pods to pre-create (raw mode only) |
+| `warm_pool_name` | `str \| None` | `None` | `SandboxWarmPool` resource to claim from (agent-sandbox only) |
+| `kube_api_url` | `str \| None` | `None` | K8s API URL for SandboxClaim management (agent-sandbox, defaults to in-cluster) |
+| `kube_token` | `str \| None` | `None` | Bearer token for K8s API (agent-sandbox; auto-reads in-cluster token if unset) |
+
+### Warm pool configuration
+
+**agent-sandbox mode** — use a `SandboxWarmPool` CRD (managed by the controller):
+
+```yaml
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxWarmPool
+metadata:
+  name: python-pool
+  namespace: default
+spec:
+  templateName: python-sandbox-template
+  size: 5
+```
+
+```python
+provider = KubernetesProvider(KubernetesProviderConfig(
+    template_name="python-sandbox-template",
+    warm_pool_name="python-pool",
+))
+```
+
+**raw mode** — built-in provider-managed pool:
+
+```python
+provider = KubernetesProvider(KubernetesProviderConfig(
+    mode="raw",
+    warm_pool_size=3,
+))
+```
+
+See [`docs/warm-pool.yaml`](../docs/warm-pool.yaml) for full examples.
 
 ## Execute Commands
 

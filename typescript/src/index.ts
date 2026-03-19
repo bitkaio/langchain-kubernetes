@@ -35,7 +35,17 @@
 export { KubernetesSandbox } from "./sandbox.js";
 
 export { KubernetesProvider } from "./provider.js";
-export type { SandboxInfo, SandboxListResponse } from "./provider.js";
+export type {
+  SandboxInfo,
+  SandboxListResponse,
+  CleanupResult,
+  WarmPoolStatus,
+  ProviderStats,
+  GetOrCreateOptions,
+} from "./provider.js";
+
+export { KubernetesSandboxManager } from "./manager.js";
+export type { KubernetesSandboxManagerOptions } from "./manager.js";
 
 export type {
   KubernetesProviderConfig,

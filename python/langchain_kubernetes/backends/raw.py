@@ -14,6 +14,16 @@ from typing import TYPE_CHECKING, Any
 
 from deepagents.backends.protocol import ExecuteResponse, FileDownloadResponse, FileUploadResponse
 
+from langchain_kubernetes._labels import (
+    ANN_LAST_ACTIVITY,
+    LABEL_POOL_STATUS,
+    LABEL_THREAD_ID,
+    MANAGED_SELECTOR,
+    POOL_STATUS_ACTIVE,
+    now_iso,
+    sanitize_label_value,
+    thread_id_selector,
+)
 from langchain_kubernetes._provider_base import SandboxNotFoundError
 from langchain_kubernetes._utils import generate_sandbox_id
 from langchain_kubernetes.backends.raw_manifests import (
@@ -77,6 +87,7 @@ class RawK8sBackend:
         core_v1: Any,
         networking_v1: Any,
         config: "KubernetesProviderConfig",
+        ttl_idle_seconds: int | None = None,
     ) -> None:
         self._sandbox_id = sandbox_id
         self._pod_name = pod_name
@@ -85,6 +96,7 @@ class RawK8sBackend:
         self._core_v1 = core_v1
         self._networking_v1 = networking_v1
         self._config = config
+        self._ttl_idle_seconds = ttl_idle_seconds
 
     # ------------------------------------------------------------------
     # Protocol: id
@@ -126,7 +138,26 @@ class RawK8sBackend:
             command,
             effective_timeout,
         )
-        return ExecuteResponse(output=output, exit_code=exit_code, truncated=truncated)
+        result = ExecuteResponse(output=output, exit_code=exit_code, truncated=truncated)
+        if self._ttl_idle_seconds is not None:
+            self._update_last_activity()
+        return result
+
+    def _update_last_activity(self) -> None:
+        """Patch the Pod annotation with the current UTC time (fire-and-forget)."""
+        try:
+            patch = {"metadata": {"annotations": {ANN_LAST_ACTIVITY: now_iso()}}}
+            self._core_v1.patch_namespaced_pod(
+                name=self._pod_name,
+                namespace=self._namespace,
+                body=patch,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to update last-activity annotation on Pod %s: %s",
+                self._pod_name,
+                exc,
+            )
 
     async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """Async variant — runs :meth:`execute` in a thread pool.
@@ -215,6 +246,9 @@ class RawK8sBackend:
         cls,
         config: "KubernetesProviderConfig",
         sandbox_id: str | None = None,
+        extra_labels: dict[str, Any] | None = None,
+        extra_annotations: dict[str, str] | None = None,
+        ttl_idle_seconds: int | None = None,
     ) -> "RawK8sBackend":
         """Provision a new Pod and return a ``RawK8sBackend`` for it.
 
@@ -250,7 +284,11 @@ class RawK8sBackend:
             _create_namespace(core_v1, namespace)
 
         pod_name = f"deepagents-{sandbox_id}"
-        pod_manifest = build_pod_manifest(config, sandbox_id)
+        pod_manifest = build_pod_manifest(
+            config, sandbox_id,
+            extra_labels=extra_labels,
+            extra_annotations=extra_annotations,
+        )
 
         logger.info(
             "Creating sandbox Pod %s in namespace %s", pod_name, namespace
@@ -283,7 +321,145 @@ class RawK8sBackend:
             core_v1=core_v1,
             networking_v1=networking_v1,
             config=config,
+            ttl_idle_seconds=ttl_idle_seconds,
         )
+
+    @classmethod
+    def find_by_thread_id(
+        cls,
+        config: "KubernetesProviderConfig",
+        thread_id: str,
+    ) -> "RawK8sBackend | None":
+        """Look up a running Pod by thread-id label.
+
+        Args:
+            config: Provider configuration.
+            thread_id: Thread identifier to search for.
+
+        Returns:
+            ``RawK8sBackend`` for the running Pod, or ``None`` if not found.
+        """
+        core_v1, networking_v1 = _load_k8s_clients()
+        selector = thread_id_selector(thread_id)
+        try:
+            pod_list = core_v1.list_namespaced_pod(
+                namespace=config.namespace,
+                label_selector=selector,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to list Pods by thread_id=%s: %s", thread_id, exc
+            )
+            return None
+
+        for pod in (pod_list.items or []):
+            phase = pod.status.phase if pod.status else None
+            if phase == "Running":
+                pod_name = pod.metadata.name
+                # Extract sandbox_id from pod label
+                labels = pod.metadata.labels or {}
+                from langchain_kubernetes.backends.raw_manifests import LABEL_SANDBOX_ID
+                sandbox_id = labels.get(LABEL_SANDBOX_ID, pod_name.removeprefix("deepagents-"))
+                namespace = pod.metadata.namespace or config.namespace
+                logger.info(
+                    "Found existing Pod %s for thread_id=%s", pod_name, thread_id
+                )
+                return cls(
+                    sandbox_id=sandbox_id,
+                    pod_name=pod_name,
+                    namespace=namespace,
+                    container="sandbox",
+                    core_v1=core_v1,
+                    networking_v1=networking_v1,
+                    config=config,
+                )
+        return None
+
+    @classmethod
+    def claim_warm_pod(
+        cls,
+        config: "KubernetesProviderConfig",
+        thread_id: str,
+        extra_labels: dict[str, Any] | None = None,
+        extra_annotations: dict[str, str] | None = None,
+        ttl_idle_seconds: int | None = None,
+    ) -> "RawK8sBackend | None":
+        """Claim a warm Pod from the pool by updating its labels.
+
+        Args:
+            config: Provider configuration.
+            thread_id: Thread to assign to the claimed Pod.
+            extra_labels: Additional labels to merge onto the Pod.
+            extra_annotations: Additional annotations to merge onto the Pod.
+            ttl_idle_seconds: Idle TTL to attach to the backend.
+
+        Returns:
+            Backend wrapping the claimed Pod, or ``None`` if no warm Pod available.
+        """
+        from langchain_kubernetes._labels import (
+            warm_pool_selector,
+            POOL_STATUS_WARM,
+        )
+
+        core_v1, networking_v1 = _load_k8s_clients()
+        try:
+            pod_list = core_v1.list_namespaced_pod(
+                namespace=config.namespace,
+                label_selector=warm_pool_selector(),
+            )
+        except Exception as exc:
+            logger.warning("Failed to list warm pool Pods: %s", exc)
+            return None
+
+        for pod in (pod_list.items or []):
+            if pod.status.phase not in ("Running", "Pending"):
+                continue
+            pod_name = pod.metadata.name
+            namespace = pod.metadata.namespace or config.namespace
+
+            # Build labels to apply: assign thread-id and mark active
+            safe_tid, _ = sanitize_label_value(thread_id)
+            patch_labels: dict[str, Any] = {
+                LABEL_THREAD_ID: safe_tid,
+                LABEL_POOL_STATUS: POOL_STATUS_ACTIVE,
+                **(extra_labels or {}),
+            }
+            patch_annotations = dict(extra_annotations or {})
+            patch = {
+                "metadata": {
+                    "labels": patch_labels,
+                    "annotations": patch_annotations or None,
+                }
+            }
+            if not patch_annotations:
+                del patch["metadata"]["annotations"]
+
+            try:
+                core_v1.patch_namespaced_pod(
+                    name=pod_name,
+                    namespace=namespace,
+                    body=patch,
+                )
+            except Exception as exc:
+                logger.warning("Failed to claim warm Pod %s: %s", pod_name, exc)
+                continue
+
+            from langchain_kubernetes.backends.raw_manifests import LABEL_SANDBOX_ID
+            labels = pod.metadata.labels or {}
+            sandbox_id = labels.get(LABEL_SANDBOX_ID, pod_name.removeprefix("deepagents-"))
+            logger.info("Claimed warm Pod %s for thread_id=%s", pod_name, thread_id)
+            return cls(
+                sandbox_id=sandbox_id,
+                pod_name=pod_name,
+                namespace=namespace,
+                container="sandbox",
+                core_v1=core_v1,
+                networking_v1=networking_v1,
+                config=config,
+                ttl_idle_seconds=ttl_idle_seconds,
+            )
+
+        return None
 
     @classmethod
     def reconnect(
@@ -335,6 +511,15 @@ class RawK8sBackend:
             networking_v1=networking_v1,
             config=config,
         )
+
+    # ------------------------------------------------------------------
+    # Static helpers for provider-level operations
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def load_k8s_clients() -> tuple[Any, Any]:
+        """Load and return ``(CoreV1Api, NetworkingV1Api)`` — public alias."""
+        return _load_k8s_clients()
 
     # ------------------------------------------------------------------
     # Internal helpers

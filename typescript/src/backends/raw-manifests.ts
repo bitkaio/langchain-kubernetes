@@ -14,9 +14,11 @@ export function buildPodManifest(
   podName: string,
   namespace: string,
   sandboxId: string,
-  config: KubernetesProviderConfig
+  config: KubernetesProviderConfig,
+  extraLabels?: Record<string, string>,
+  extraAnnotations?: Record<string, string>
 ): k8s.V1Pod {
-  const labels = sandboxLabels(sandboxId);
+  const labels = { ...sandboxLabels(sandboxId), ...extraLabels };
 
   const envVars: k8s.V1EnvVar[] = config.env
     ? Object.entries(config.env).map(([name, value]) => ({ name, value }))
@@ -78,8 +80,13 @@ export function buildPodManifest(
       name: podName,
       namespace,
       labels,
-      annotations: config.podTtlSeconds
-        ? { "deepagents.langchain.com/ttl-seconds": String(config.podTtlSeconds) }
+      annotations: (config.podTtlSeconds || (extraAnnotations && Object.keys(extraAnnotations).length > 0))
+        ? {
+          ...(config.podTtlSeconds
+            ? { "deepagents.langchain.com/ttl-seconds": String(config.podTtlSeconds) }
+            : {}),
+          ...extraAnnotations,
+        }
         : undefined,
     },
     spec: podSpec,

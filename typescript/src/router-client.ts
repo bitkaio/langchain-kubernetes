@@ -172,14 +172,69 @@ export class SandboxRouterClient {
   }
 
   /**
-   * List all SandboxClaims in the configured namespace.
+   * List all SandboxClaims in the configured namespace, optionally filtered
+   * by a label selector.
+   *
+   * @param labelSelector - Kubernetes label selector string.
+   * @param continueToken - Pagination continue token.
    */
-  async listSandboxes(): Promise<SandboxInfo[]> {
+  async listSandboxes(
+    labelSelector?: string,
+    continueToken?: string
+  ): Promise<SandboxInfo[]> {
+    let path = `/apis/${CLAIM_API_GROUP}/${CLAIM_API_VERSION}/namespaces/${this.namespace}/${CLAIM_PLURAL}`;
+    const params: string[] = [];
+    if (labelSelector) params.push(`labelSelector=${encodeURIComponent(labelSelector)}`);
+    if (continueToken) params.push(`continue=${encodeURIComponent(continueToken)}`);
+    if (params.length > 0) path += `?${params.join("&")}`;
+
     const resp = await this.k8sRequest<{ items: unknown[] }>(
       "GET",
-      `/apis/${CLAIM_API_GROUP}/${CLAIM_API_VERSION}/namespaces/${this.namespace}/${CLAIM_PLURAL}`
+      path
     );
     return (resp.items ?? []).map((item) => claimToInfo(item, this.namespace));
+  }
+
+  /**
+   * List raw SandboxClaim objects (with full metadata) filtered by label selector.
+   *
+   * @param labelSelector - Kubernetes label selector string.
+   */
+  async listSandboxClaims(labelSelector?: string): Promise<unknown[]> {
+    let path = `/apis/${CLAIM_API_GROUP}/${CLAIM_API_VERSION}/namespaces/${this.namespace}/${CLAIM_PLURAL}`;
+    if (labelSelector) {
+      path += `?labelSelector=${encodeURIComponent(labelSelector)}`;
+    }
+    const resp = await this.k8sRequest<{ items: unknown[] }>("GET", path);
+    return resp.items ?? [];
+  }
+
+  /**
+   * Patch a SandboxClaim with merge-patch (labels and/or annotations).
+   *
+   * @param claimName - The claim name to patch.
+   * @param labels - Labels to merge onto the claim metadata.
+   * @param annotations - Annotations to merge onto the claim metadata.
+   */
+  async patchSandboxClaim(
+    claimName: string,
+    labels: Record<string, string>,
+    annotations: Record<string, string>
+  ): Promise<void> {
+    const patch: Record<string, unknown> = { metadata: {} };
+    const meta = patch["metadata"] as Record<string, unknown>;
+    if (Object.keys(labels).length > 0) meta["labels"] = labels;
+    if (Object.keys(annotations).length > 0) meta["annotations"] = annotations;
+
+    try {
+      await this.k8sRequest(
+        "PATCH",
+        `/apis/${CLAIM_API_GROUP}/${CLAIM_API_VERSION}/namespaces/${this.namespace}/${CLAIM_PLURAL}/${claimName}`,
+        patch
+      );
+    } catch {
+      // Non-fatal — log at DEBUG level in production
+    }
   }
 
   /**
@@ -378,13 +433,14 @@ export class SandboxRouterClient {
   private async k8sRequest<T>(
     method: string,
     path: string,
-    body?: unknown
+    body?: unknown,
+    contentType?: string
   ): Promise<T> {
     const token = await this.readToken();
     const url = `${this.kubeApiUrl}${path}`;
 
     const headers: Record<string, string> = {
-      "Content-Type": "application/json",
+      "Content-Type": contentType ?? (method === "PATCH" ? "application/merge-patch+json" : "application/json"),
       Accept: "application/json",
     };
     if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -414,8 +470,8 @@ export class SandboxRouterClient {
 
     if (resp.status === 204) return undefined as T;
 
-    const contentType = resp.headers.get("content-type") ?? "";
-    if (!contentType.includes("application/json")) return undefined as T;
+    const respContentType = resp.headers.get("content-type") ?? "";
+    if (!respContentType.includes("application/json")) return undefined as T;
 
     return (await resp.json()) as T;
   }

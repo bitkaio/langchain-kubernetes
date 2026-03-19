@@ -140,7 +140,8 @@ class TestGetOrCreateRaw:
 class TestList:
     def test_list_empty_initially(self):
         provider = KubernetesProvider(_agent_sandbox_config())
-        assert provider.list() == []
+        result = provider.list()
+        assert result.sandboxes == []
 
     def test_list_returns_active_sandboxes(self):
         provider = KubernetesProvider(_agent_sandbox_config())
@@ -149,9 +150,9 @@ class TestList:
         with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=mock_client):
             provider.get_or_create()
 
-        sandboxes = provider.list()
-        assert len(sandboxes) == 1
-        assert sandboxes[0].id == "sb-001"
+        result = provider.list()
+        assert len(result.sandboxes) == 1
+        assert result.sandboxes[0].id == "sb-001"
 
     def test_list_multiple_sandboxes(self):
         provider = KubernetesProvider(_agent_sandbox_config())
@@ -160,7 +161,8 @@ class TestList:
             with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=client):
                 provider.get_or_create()
 
-        assert len(provider.list()) == 3
+        result = provider.list()
+        assert len(result.sandboxes) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +190,9 @@ class TestDelete:
         with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=mock_client):
             provider.get_or_create()
 
-        assert len(provider.list()) == 1
+        assert len(provider.list().sandboxes) == 1
         provider.delete(sandbox_id="sb-del")
-        assert len(provider.list()) == 0
+        assert len(provider.list().sandboxes) == 0
 
     def test_delete_nonexistent_is_noop(self):
         provider = KubernetesProvider(_agent_sandbox_config())
@@ -294,9 +296,9 @@ class TestAsync:
         with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=mock_client):
             await provider.aget_or_create()
 
-        sandboxes = await provider.alist()
-        assert len(sandboxes) == 1
-        assert sandboxes[0].id == "async-list-sb"
+        result = await provider.alist()
+        assert len(result.sandboxes) == 1
+        assert result.sandboxes[0].id == "async-list-sb"
 
 
 # ---------------------------------------------------------------------------

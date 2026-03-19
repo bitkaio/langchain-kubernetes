@@ -112,6 +112,113 @@ try {
 }
 ```
 
+## Per-conversation sandboxes
+
+Assign a persistent sandbox to each conversation thread with a single call — the provider looks up an existing sandbox by thread ID before creating a new one:
+
+```python
+# Python — one line, idempotent
+sandbox = provider.get_or_create(thread_id="conv-abc-123", ttl_seconds=3600)
+```
+
+```typescript
+// TypeScript — same pattern
+const sandbox = await provider.getOrCreate({ threadId: "conv-abc-123", ttlSeconds: 3600 });
+```
+
+Compare with alternative sandboxing libraries that require manual try/except lifecycle management:
+
+```python
+# Other provider (verbose)
+try:
+    sandbox = client.get(sandbox_id)
+except SandboxNotFound:
+    sandbox = client.create(image="python:3.12", timeout=30)
+    client.update_metadata(sandbox.id, {"thread_id": "conv-abc-123"})
+# No TTL, no warm pool, no label-based lookup
+```
+
+For LangGraph, use `KubernetesSandboxManager` — it wires directly into the `backend_factory` interface:
+
+```python
+from langchain_kubernetes import KubernetesSandboxManager, KubernetesProviderConfig
+
+manager = KubernetesSandboxManager(
+    KubernetesProviderConfig(template_name="python-sandbox-template"),
+    ttl_idle_seconds=1800,   # auto-cleanup after 30 min of inactivity
+)
+
+# Pass to LangGraph — thread_id is extracted from RunnableConfig automatically
+agent = create_deep_agent(model=llm, backend=manager.backend_factory)
+
+# TypeScript equivalent
+const manager = new KubernetesSandboxManager(
+  { templateName: "python-sandbox-template", routerUrl: "..." },
+  { ttlIdleSeconds: 1800 },
+);
+const factory = manager.backendFactory; // (config: RunnableConfig) => Promise<KubernetesSandbox>
+```
+
+## Warm pool — sub-second startup
+
+Cold-starting a sandbox Pod takes 5–30 seconds. Warm pools keep pre-provisioned sandboxes ready for instant assignment.
+
+**agent-sandbox mode** — managed by the `kubernetes-sigs/agent-sandbox` controller via a `SandboxWarmPool` CRD:
+
+```yaml
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxWarmPool
+metadata:
+  name: python-pool
+spec:
+  templateName: python-sandbox-template
+  size: 5        # keep 5 sandboxes pre-warmed at all times
+```
+
+```python
+provider = KubernetesProvider(KubernetesProviderConfig(
+    template_name="python-sandbox-template",
+    warm_pool_name="python-pool",   # claim from this pool
+))
+```
+
+**raw mode** — built-in provider-managed warm pool. No CRDs, no controller:
+
+```python
+provider = KubernetesProvider(KubernetesProviderConfig(
+    mode="raw",
+    warm_pool_size=3,   # pre-create 3 idle Pods, replenish after each delete
+))
+```
+
+This matters for chat applications: when a user sends their first message, the sandbox is already running. Startup latency is invisible to the user. See [`docs/warm-pool.yaml`](docs/warm-pool.yaml) for annotated examples.
+
+## For regulated industries
+
+All sandbox execution happens inside **your own cluster** — no data leaves your network:
+
+- **On-prem / air-gapped**: works with any CNCF-conformant Kubernetes distribution including OpenShift, Rancher, and air-gapped kind clusters
+- **Network isolation**: every sandbox Pod gets a deny-all `NetworkPolicy` — no internet access, no cross-sandbox traffic — enforced at the kernel networking layer
+- **gVisor / Kata Containers**: use hardware-isolated runtimes in agent-sandbox mode by setting `runtimeClassName` in your `SandboxTemplate`
+- **No data egress**: the sandbox-router and all execution traffic stay in-cluster; the SDK makes no external calls
+- **Audit trail**: every sandbox carries `langchain-kubernetes.bitkaio.com/thread-id`, `created-at`, and `last-activity` annotations — queryable with `kubectl get pods --show-labels` or your existing observability stack
+
+See [`docs/openshift.md`](docs/openshift.md) for OpenShift-specific notes (SCC, UID ranges, Routes).
+
+## Feature comparison
+
+| Feature                       | langchain-kubernetes | Daytona   | Modal | Runloop |
+| ----------------------------- | -------------------- | --------- | ----- | ------- |
+| Self-hosted / on-prem         | ✅                   | ❌        | ❌    | ❌      |
+| Per-thread `get_or_create`    | ✅ built-in          | ✅ manual | ❌    | ❌      |
+| LangGraph `backend_factory`   | ✅                   | ❌        | ❌    | ❌      |
+| Warm pools                    | ✅                   | ❌        | ❌    | ❌      |
+| gVisor / Kata isolation       | ✅                   | ❌        | ❌    | ❌      |
+| Network policies per sandbox  | ✅                   | ❌        | ❌    | ❌      |
+| TTL auto-cleanup              | ✅                   | ✅        | ✅    | ❌      |
+
+---
+
 ## Use with DeepAgents
 
 ```python
