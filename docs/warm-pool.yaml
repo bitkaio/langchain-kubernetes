@@ -1,0 +1,105 @@
+# ── Warm Pool Configuration Examples ──────────────────────────────────────────
+#
+# These samples show how to configure warm pools in both backend modes.
+#
+# Warm pools keep a number of sandboxes pre-provisioned so that the first
+# agent request for a conversation gets a sub-second sandbox, not a cold-start.
+#
+# ── agent-sandbox mode: SandboxWarmPool CRD ───────────────────────────────────
+#
+# In agent-sandbox mode, pre-provisioned sandboxes are managed by the
+# kubernetes-sigs/agent-sandbox controller via a SandboxWarmPool CRD.
+# Install the controller first:
+#   kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/install.yaml
+#
+# Then create the template and warm pool:
+
+---
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: python-sandbox-template
+  namespace: default
+spec:
+  runtimeClassName: gvisor   # or "kata-containers", omit for runc
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "1000m"
+      memory: "1Gi"
+  image: python:3.12-slim
+  command: ["sleep", "infinity"]
+
+---
+apiVersion: agents.x-k8s.io/v1alpha1
+kind: SandboxWarmPool
+metadata:
+  name: python-pool
+  namespace: default
+spec:
+  templateName: python-sandbox-template
+  size: 5                       # Keep 5 sandboxes warm at all times
+  maxIdleSeconds: 300           # Reclaim warm sandboxes unused for 5 minutes
+
+# Provider config (Python):
+#
+#   provider = KubernetesProvider(KubernetesProviderConfig(
+#       mode="agent-sandbox",
+#       template_name="python-sandbox-template",
+#       warm_pool_name="python-pool",       # claim from this pool
+#       namespace="default",
+#   ))
+#
+# Provider config (TypeScript):
+#
+#   const provider = new KubernetesProvider({
+#     mode: "agent-sandbox",
+#     templateName: "python-sandbox-template",
+#     warmPoolName: "python-pool",
+#     routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
+#   });
+
+
+# ── raw mode: provider-managed warm pool ──────────────────────────────────────
+#
+# In raw mode there is no CRD controller. The provider pre-creates idle Pods
+# labelled "pool-status=warm" and claims them on getOrCreate().
+#
+# Provider config (Python):
+#
+#   provider = KubernetesProvider(KubernetesProviderConfig(
+#       mode="raw",
+#       warm_pool_size=3,          # keep 3 warm Pods
+#       namespace="deepagents-sandboxes",
+#       image="python:3.12-slim",
+#   ))
+#
+# Provider config (TypeScript):
+#
+#   const provider = new KubernetesProvider({
+#     mode: "raw",
+#     warmPoolSize: 3,
+#     namespace: "deepagents-sandboxes",
+#     image: "python:3.12-slim",
+#   });
+#
+# The warm pool is initialised lazily on the first getOrCreate() call and
+# replenished automatically after each delete().
+#
+# RBAC required for raw mode (the pod that runs your agent needs these):
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: langchain-kubernetes-sandbox-manager
+  namespace: deepagents-sandboxes
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete, patch]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [networkpolicies]
+    verbs: [get, list, create, delete]

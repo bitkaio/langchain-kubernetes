@@ -1,0 +1,98 @@
+# ── Reaper CronJob ─────────────────────────────────────────────────────────────
+#
+# Periodically call provider.cleanup() to remove sandboxes that have exceeded
+# their TTL or idle threshold. Run this inside the cluster so it has API access.
+#
+# This is optional: the provider automatically enforces TTLs during normal
+# operation (getOrCreate, delete). The reaper handles cases where the agent
+# process itself is not running (e.g. it crashed or was restarted).
+#
+# Python reaper script (save as reaper.py and bake into a Docker image):
+#
+#   from langchain_kubernetes import KubernetesProvider, KubernetesProviderConfig
+#   import asyncio, logging
+#
+#   logging.basicConfig(level=logging.INFO)
+#   provider = KubernetesProvider(KubernetesProviderConfig(
+#       mode="agent-sandbox",       # or "raw"
+#       template_name="python-sandbox-template",
+#   ))
+#
+#   result = provider.cleanup()
+#   print(f"Reaper: deleted={result.deleted}, kept={result.kept}")
+#
+# TypeScript reaper (save as reaper.ts):
+#
+#   import { KubernetesProvider } from "@bitkaio/langchain-kubernetes";
+#   const provider = new KubernetesProvider({ mode: "agent-sandbox", ... });
+#   const result = await provider.cleanup();
+#   console.log(`Reaper: deleted=${result.deleted.length}, kept=${result.kept}`);
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: langchain-kubernetes-reaper
+  namespace: default
+spec:
+  schedule: "*/15 * * * *"        # every 15 minutes
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          serviceAccountName: langchain-kubernetes-reaper
+          containers:
+            - name: reaper
+              image: your-registry/langchain-kubernetes-reaper:latest
+              command: ["python", "-u", "/app/reaper.py"]
+              env:
+                - name: SANDBOX_MODE
+                  value: "agent-sandbox"
+                - name: SANDBOX_TEMPLATE
+                  value: "python-sandbox-template"
+                - name: SANDBOX_NAMESPACE
+                  value: "default"
+
+---
+# RBAC for the reaper ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: langchain-kubernetes-reaper
+  namespace: default
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: langchain-kubernetes-reaper
+rules:
+  # agent-sandbox mode: manage SandboxClaims
+  - apiGroups: ["extensions.agents.x-k8s.io"]
+    resources: [sandboxclaims]
+    verbs: [get, list, delete]
+  # raw mode: manage Pods
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, delete, patch]
+  - apiGroups: ["networking.k8s.io"]
+    resources: [networkpolicies]
+    verbs: [get, list, delete]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: langchain-kubernetes-reaper
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: langchain-kubernetes-reaper
+subjects:
+  - kind: ServiceAccount
+    name: langchain-kubernetes-reaper
+    namespace: default
