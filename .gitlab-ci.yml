@@ -13,12 +13,18 @@ workflow:
   rules:
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
     - if: $CI_COMMIT_TAG =~ /^(py|ts)-\d+\.\d+\.\d+/
+    # Allow a pipeline to be created on any branch so that the manual
+    # dev-publish jobs below are accessible from the GitLab UI / API.
+    # Automatic jobs on non-main branches have their own guards and will
+    # not run — only the manual jobs are visible.
+    - if: $CI_COMMIT_BRANCH
 
 stages:
   - test
   - build
   - publish-gitlab
   - publish-public
+  - dev-publish
 
 # ---------------------------------------------------------------------------
 # Reusable rule anchors
@@ -205,6 +211,102 @@ python:publish-pypi:
         python -m twine upload dist/*
   environment:
     name: pypi
+
+# ---------------------------------------------------------------------------
+# Stage: dev-publish
+#
+# Manual jobs — trigger from any branch via the GitLab UI ("Run pipeline" or
+# the play button next to the job) or via the API.
+#
+# Version scheme (GitLab Package Registry only — never touches public registries):
+#   Python:     {base_version}.dev{CI_PIPELINE_IID}
+#               e.g. 0.1.0.dev42   — valid PEP 440, sorts below 0.1.0
+#   TypeScript: {base_version}-dev.{CI_PIPELINE_IID}
+#               e.g. 0.0.1-dev.42  — valid semver pre-release
+#               published with --tag dev (never affects the npm `latest` tag)
+#
+# CI_PIPELINE_IID is a project-scoped sequential integer that increases with
+# every pipeline, giving a unique, comparable version for every manual build.
+# ---------------------------------------------------------------------------
+
+.dev-publish-base:
+  stage: dev-publish
+  when: manual
+  allow_failure: false
+  # Available on every branch; the `when: manual` guard means it never runs
+  # automatically.
+  rules:
+    - if: $CI_COMMIT_BRANCH
+      when: manual
+
+python:dev-publish:
+  extends: .dev-publish-base
+  image: python:3.11-slim
+  variables:
+    # The base version is read from pyproject.toml at runtime so this file
+    # never needs to be edited for dev builds.
+    DEV_VERSION_SUFFIX: ".dev${CI_PIPELINE_IID}"
+  before_script:
+    - pip install poetry twine
+    - cd python && poetry install --with dev
+  script:
+    # ── 1. Run unit tests ────────────────────────────────────────────────────
+    - poetry run pytest tests/unit/ -q
+    # ── 2. Compute dev version ───────────────────────────────────────────────
+    - BASE_VERSION=$(poetry version --short)
+    - DEV_VERSION="${BASE_VERSION}.dev${CI_PIPELINE_IID}"
+    - echo "Dev version → ${DEV_VERSION}  (branch=${CI_COMMIT_REF_NAME}, pipeline=${CI_PIPELINE_IID})"
+    # ── 3. Stamp version and build wheel + sdist ─────────────────────────────
+    - poetry version "${DEV_VERSION}"
+    - poetry build
+    # ── 4. Publish to GitLab PyPI registry ──────────────────────────────────
+    - |
+      TWINE_USERNAME="gitlab-ci-token" \
+      TWINE_PASSWORD="${CI_JOB_TOKEN}" \
+      python -m twine upload \
+        --repository-url "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/pypi" \
+        dist/*
+    - echo "Published ${DEV_VERSION} to GitLab PyPI registry"
+  environment:
+    name: gitlab-registry/python-dev
+  artifacts:
+    name: "python-dev-${CI_PIPELINE_IID}"
+    paths:
+      - python/dist/
+    expire_in: 7 days
+
+typescript:dev-publish:
+  extends: .dev-publish-base
+  image: node:22-slim
+  before_script:
+    - npm install -g pnpm
+    - cd typescript && pnpm install --frozen-lockfile
+  script:
+    # ── 1. Run unit tests ────────────────────────────────────────────────────
+    - pnpm test
+    # ── 2. Compute dev version ───────────────────────────────────────────────
+    - BASE_VERSION=$(node -p "require('./package.json').version")
+    - DEV_VERSION="${BASE_VERSION}-dev.${CI_PIPELINE_IID}"
+    - echo "Dev version → ${DEV_VERSION}  (branch=${CI_COMMIT_REF_NAME}, pipeline=${CI_PIPELINE_IID})"
+    # ── 3. Stamp version and build ───────────────────────────────────────────
+    - npm version "${DEV_VERSION}" --no-git-tag-version --allow-same-version
+    - pnpm build
+    # ── 4. Configure GitLab npm registry for the @bitkaio scope ─────────────
+    - |
+      cat >> .npmrc <<EOF
+      @bitkaio:registry=https://${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/packages/npm/
+      //${CI_SERVER_HOST}/api/v4/projects/${CI_PROJECT_ID}/packages/npm/:_authToken=${CI_JOB_TOKEN}
+      EOF
+    # ── 5. Publish with dist-tag "dev" (never overwrites "latest") ───────────
+    - pnpm publish --no-git-checks --tag dev
+    - echo "Published ${DEV_VERSION} to GitLab npm registry (tag=dev)"
+  environment:
+    name: gitlab-registry/typescript-dev
+  artifacts:
+    name: "typescript-dev-${CI_PIPELINE_IID}"
+    paths:
+      - typescript/dist/
+    expire_in: 7 days
 
 typescript:publish-npmjs:
   stage: publish-public
