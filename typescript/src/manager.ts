@@ -1,17 +1,20 @@
-import { randomUUID } from "node:crypto";
+/**
+ * KubernetesSandboxManager — LangGraph-integrated sandbox lifecycle manager.
+ *
+ * Provides {@link KubernetesSandboxManager.createAgentNode} — a factory that
+ * returns a LangGraph node function managing the complete sandbox lifecycle.
+ * All sandbox state is stored in graph state and persisted by LangGraph's
+ * checkpointer — no Kubernetes label writes or direct cluster API access needed.
+ */
+
 import type { KubernetesProviderConfig } from "./config.js";
 import { KubernetesProvider } from "./provider.js";
+import type { CleanupResult } from "./provider.js";
 import { KubernetesSandbox } from "./sandbox.js";
 
-// ── Types ──────────────────────────────────────────────────────────────────────
+// ── Types ───────────────────────────────────────────────────────────────────
 
-/** LangGraph / LangChain RunnableConfig shape (duck-typed). */
-type RunnableConfig = {
-  configurable?: Record<string, unknown>;
-  [key: string]: unknown;
-};
-
-/** Options for KubernetesSandboxManager. */
+/** Options for {@link KubernetesSandboxManager}. */
 export interface KubernetesSandboxManagerOptions {
   /** Absolute TTL from creation (seconds). Passed to every getOrCreate() call. */
   ttlSeconds?: number;
@@ -21,29 +24,57 @@ export interface KubernetesSandboxManagerOptions {
   defaultLabels?: Record<string, string>;
 }
 
-// ── Manager ────────────────────────────────────────────────────────────────────
+/** @internal */
+type AnyModel = unknown;
+
+// ── Manager ─────────────────────────────────────────────────────────────────
 
 /**
- * High-level sandbox manager with a LangGraph-compatible `backendFactory`.
+ * High-level sandbox manager for LangGraph applications.
  *
- * Wraps a {@link KubernetesProvider} and maintains an in-process cache of
- * sandboxes keyed by `thread_id`. Intended for use with LangGraph's
- * `InMemorySandboxedExecutor` or any framework that needs a factory callable.
+ * Wraps a stateless {@link KubernetesProvider} and provides
+ * {@link createAgentNode} — a factory that returns a LangGraph node function
+ * handling the complete sandbox lifecycle:
  *
- * @example LangGraph integration
+ * 1. Read `sandboxId` from graph state (`null`/`undefined` on first run).
+ * 2. Reconnect to the existing sandbox if `sandboxId` is set and still alive.
+ * 3. Provision a new sandbox if none exists or the previous one expired.
+ * 4. Run the DeepAgents agent with the sandbox for this invocation.
+ * 5. Write the (possibly new) `sandboxId` back to graph state so LangGraph's
+ *    checkpointer persists it for the next run.
+ *
+ * **No state is held in memory.** The `sandboxId` lives exclusively in the
+ * LangGraph graph state and is persisted by whichever checkpointer the user
+ * configures (`MemorySaver`, `PostgresSaver`, `RedisSaver`, …). This means
+ * the integration works transparently across process restarts, horizontal
+ * scaling, and the LangGraph Platform without any Kubernetes label machinery.
+ *
+ * @example Minimal LangGraph integration
  * ```typescript
+ * import { StateGraph, END, MemorySaver } from "@langchain/langgraph";
+ * import { Annotation } from "@langchain/langgraph";
  * import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
  *
+ * const AgentState = Annotation.Root({
+ *   messages: Annotation<BaseMessage[]>({ reducer: (a, b) => a.concat(b) }),
+ *   sandboxId: Annotation<string | undefined>({ reducer: (_, b) => b }),
+ * });
+ *
  * const manager = new KubernetesSandboxManager(
- *   { mode: "agent-sandbox", routerUrl: "http://...", templateName: "python" },
+ *   {
+ *     mode: "agent-sandbox",
+ *     routerUrl: "http://my-gateway/sandbox-router",
+ *     templateName: "python-sandbox-template",
+ *   },
  *   { ttlIdleSeconds: 1800 }
  * );
  *
- * // Pass to LangGraph as the executor factory:
- * const executor = new SandboxedExecutor({ backendFactory: manager.backendFactory });
+ * const builder = new StateGraph(AgentState)
+ *   .addNode("agent", manager.createAgentNode(model))
+ *   .addEdge("__start__", "agent")
+ *   .addEdge("agent", END);
  *
- * // Cleanup on shutdown:
- * await manager.shutdown();
+ * const graph = builder.compile({ checkpointer: new MemorySaver() });
  * ```
  */
 export class KubernetesSandboxManager {
@@ -53,14 +84,6 @@ export class KubernetesSandboxManager {
   private readonly ttlSeconds?: number;
   private readonly ttlIdleSeconds?: number;
   private readonly defaultLabels?: Record<string, string>;
-  /** thread_id → KubernetesSandbox */
-  private readonly _cache = new Map<string, KubernetesSandbox>();
-  /**
-   * In-flight provisions keyed by thread_id. Concurrent callers for the same
-   * thread_id all await the same Promise instead of each starting their own
-   * getOrCreate — preventing N orphaned sandboxes for a single thread.
-   */
-  private readonly _pending = new Map<string, Promise<KubernetesSandbox>>();
 
   constructor(
     config: Partial<KubernetesProviderConfig>,
@@ -72,104 +95,200 @@ export class KubernetesSandboxManager {
     this.defaultLabels = options.defaultLabels;
   }
 
-  // ── Synchronous factory (for LangGraph) ─────────────────────────────────────
+  // ── Primary integration point: compiled agent factory ─────────────────────
 
   /**
-   * Returns a synchronous factory function suitable for use with LangGraph's
-   * `InMemorySandboxedExecutor`.
+   * Return a compiled DeepAgents graph with automatic per-conversation sandbox management.
    *
-   * The factory extracts `thread_id` from the LangGraph config's
-   * `configurable` field, hits the provider, and caches the result.
+   * This is the recommended integration point for most applications. Equivalent to
+   * building a `StateGraph` with {@link createAgentNode} but without the boilerplate.
+   * Invoke with `config: { configurable: { thread_id: "..." } }` to route each
+   * conversation to its own persistent sandbox.
    *
-   * @returns `(config: RunnableConfig) => Promise<KubernetesSandbox>`
+   * @param model - A LangChain `BaseChatModel` (or compatible) passed to
+   *   `createDeepAgent()`.
+   * @param options.checkpointer - LangGraph checkpointer (`MemorySaver`,
+   *   `PostgresSaver`, …). Required when calling `.invoke()` directly (e.g. in
+   *   Express). The LangGraph Platform / `langgraph dev` provide their own
+   *   checkpointer — omit it there.
+   * @param options.stateSandboxKey - State field name for the sandbox ID.
+   *   Defaults to `"sandboxId"`.
+   * @param options - Extra options forwarded to `createDeepAgent()`.
+   *
+   * @example FastAPI / Express — pass a checkpointer
+   * ```typescript
+   * const agent = await manager.createAgent(llm, { checkpointer: new MemorySaver() });
+   * const result = await agent.invoke(
+   *   { messages: [{ role: "user", content: "hello" }] },
+   *   { configurable: { thread_id: "conv-1" } },
+   * );
+   * ```
+   *
+   * @example langgraph dev / LangGraph Platform — no checkpointer needed
+   * ```typescript
+   * export const graph = await manager.createAgent(llm);
+   * ```
    */
-  get backendFactory(): (config: unknown) => Promise<KubernetesSandbox> {
-    return (config: unknown) => this.abackendFactory(config);
+  async createAgent(
+    model: AnyModel,
+    {
+      checkpointer,
+      stateSandboxKey = "sandboxId",
+      ...createDeepAgentOptions
+    }: {
+      checkpointer?: unknown;
+      stateSandboxKey?: string;
+      [key: string]: unknown;
+    } = {}
+  ): Promise<unknown> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { StateGraph, END, Annotation } = await import("@langchain/langgraph" as any);
+
+    const AgentState = Annotation.Root({
+      messages: Annotation({
+        reducer: (a: unknown[], b: unknown[]) => [...(a ?? []), ...(Array.isArray(b) ? b : [b])],
+      }),
+      [stateSandboxKey]: Annotation({
+        reducer: (_: unknown, b: unknown) => b,
+      }),
+    });
+
+    const graph = new StateGraph(AgentState)
+      .addNode("agent", this.createAgentNode(model, { stateSandboxKey, ...createDeepAgentOptions }))
+      .addEdge("__start__", "agent")
+      .addEdge("agent", END)
+      .compile(checkpointer ? { checkpointer } : undefined);
+
+    return graph;
   }
 
-  // ── Async factory ──────────────────────────────────────────────────────────
+  // ── LangGraph node factory ─────────────────────────────────────────────────
 
   /**
-   * Resolve a sandbox for the given LangGraph/LangChain config.
+   * Return an async LangGraph node function that manages the sandbox lifecycle.
    *
-   * Extracts `thread_id` from `config.configurable.thread_id`. If missing,
-   * generates a UUID and logs a warning.
+   * The returned node reads `state[stateSandboxKey]` to reconnect an existing
+   * sandbox or create a new one, runs the DeepAgents agent against the current
+   * messages, and returns updated messages plus the (possibly new) `sandboxId`
+   * to be stored back in graph state.
    *
-   * Results are cached in-process; the same `thread_id` always returns the
-   * same sandbox instance within a manager's lifetime.
+   * **Graph state requirements** — your state annotation must include:
+   * ```typescript
+   * messages: Annotation<BaseMessage[]>({ reducer: (a, b) => a.concat(b) })
+   * sandboxId: Annotation<string | undefined>({ reducer: (_, b) => b })
+   * ```
    *
-   * @param config - A LangGraph `RunnableConfig` dict or compatible object.
+   * @param model - A LangChain `BaseChatModel` (or compatible) passed to
+   *   `createDeepAgent()`.
+   * @param stateSandboxKey - Name of the state field holding the sandbox ID.
+   *   Defaults to `"sandboxId"`.
+   * @param createDeepAgentOptions - Extra options forwarded to `createDeepAgent()`
+   *   (e.g. `tools`, `systemPrompt`).
+   *
+   * @example
+   * ```typescript
+   * builder.addNode("agent", manager.createAgentNode(model, {
+   *   systemPrompt: "You are a helpful data analyst.",
+   * }));
+   * ```
    */
-  async abackendFactory(config: unknown): Promise<KubernetesSandbox> {
-    const threadId = extractThreadId(config);
+  createAgentNode(
+    model: AnyModel,
+    {
+      stateSandboxKey = "sandboxId",
+      ...createDeepAgentOptions
+    }: {
+      stateSandboxKey?: string;
+      [key: string]: unknown;
+    } = {}
+  ): (state: Record<string, unknown>, config?: unknown) => Promise<Record<string, unknown>> {
+    const manager = this;
 
-    // Fast path: already provisioned.
-    const cached = this._cache.get(threadId);
-    if (cached) return cached;
+    return async function agentNode(
+      state: Record<string, unknown>,
+      config?: unknown
+    ): Promise<Record<string, unknown>> {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { createDeepAgent } = await import("deepagents" as any);
 
-    // Serialise concurrent provisioning for the same thread_id.
-    // If another caller is already provisioning this thread, await its result
-    // rather than starting a second getOrCreate — which would create a second
-    // orphaned sandbox (the same race seen with the Python LangGraph server).
-    const pending = this._pending.get(threadId);
-    if (pending) return pending;
+      const sandboxId = state[stateSandboxKey] as string | undefined;
 
-    const provision = this._provider
-      .getOrCreate({
-        threadId,
-        ttlSeconds: this.ttlSeconds,
-        ttlIdleSeconds: this.ttlIdleSeconds,
-        labels: this.defaultLabels,
-      })
-      .then((sandbox) => {
-        this._cache.set(threadId, sandbox);
-        this._pending.delete(threadId);
-        return sandbox;
-      })
-      .catch((err: unknown) => {
-        this._pending.delete(threadId);
-        throw err;
-      });
+      // Acquire sandbox — reconnects if sandboxId is valid, creates otherwise
+      const sandbox = await manager._getOrReconnect(sandboxId);
 
-    this._pending.set(threadId, provision);
-    return provision;
+      // Build a fresh agent bound to this sandbox for the current invocation
+      const agent = createDeepAgent(model, { backend: sandbox, ...createDeepAgentOptions });
+
+      const messages = (state["messages"] as unknown[]) ?? [];
+      const result = await agent.invoke({ messages }, config ?? {});
+
+      const updates: Record<string, unknown> = {
+        messages: (result as Record<string, unknown>)["messages"] ?? [],
+      };
+
+      // Persist sandboxId if it changed (new sandbox was provisioned)
+      if (sandbox.id !== sandboxId) {
+        updates[stateSandboxKey] = sandbox.id;
+      }
+
+      return updates;
+    };
   }
 
-  // ── Lookup ─────────────────────────────────────────────────────────────────
+  // ── Lower-level helper: acquire sandbox from state ─────────────────────────
 
   /**
-   * Return the cached sandbox for a thread ID, or `undefined` if not found.
+   * Reconnect to `sandboxId` if given and alive, else create a new sandbox.
    *
-   * @param threadId - Thread/conversation identifier.
+   * Delegates to {@link KubernetesProvider.getOrCreate}. Useful when you want
+   * to manage the node logic yourself instead of using {@link createAgentNode}.
+   *
+   * @param sandboxId - An existing sandbox ID from graph state, or `undefined`.
+   * @returns {@link KubernetesSandbox} whose `.id` may differ from `sandboxId`
+   *   when a new sandbox was provisioned.
    */
-  getSandbox(threadId: string): KubernetesSandbox | undefined {
-    return this._cache.get(threadId);
+  async getOrReconnect(sandboxId: string | undefined): Promise<KubernetesSandbox> {
+    return this._getOrReconnect(sandboxId);
   }
 
-  // ── Shutdown ───────────────────────────────────────────────────────────────
+  /** @internal */
+  private async _getOrReconnect(sandboxId: string | undefined): Promise<KubernetesSandbox> {
+    return this._provider.getOrCreate({
+      sandboxId,
+      labels: this.defaultLabels,
+      ttlSeconds: this.ttlSeconds,
+      ttlIdleSeconds: this.ttlIdleSeconds,
+    });
+  }
+
+  // ── Operational: cleanup / shutdown ────────────────────────────────────────
 
   /**
-   * Delete all managed sandboxes and clear the cache.
+   * Delete all managed sandboxes that have exceeded their TTL.
    *
-   * Errors during individual deletes are logged but do not abort the loop.
+   * Delegates to {@link KubernetesProvider.cleanup}, which queries the
+   * Kubernetes API directly and removes expired resources.
+   *
+   * @param maxIdleSeconds - Override idle threshold for this call.
+   */
+  async cleanup(maxIdleSeconds?: number): Promise<CleanupResult> {
+    return this._provider.cleanup(maxIdleSeconds);
+  }
+
+  /**
+   * Delete all sandboxes managed by this provider instance.
+   *
+   * Runs {@link cleanup} without an idle threshold, removing all managed
+   * sandboxes regardless of their remaining TTL. Useful for tearing down
+   * a dev environment or a batch job on exit.
    */
   async shutdown(): Promise<void> {
-    const entries = Array.from(this._cache.entries());
-    this._cache.clear();
-    this._pending.clear();
-
-    for (const [, sandbox] of entries) {
-      try {
-        await this._provider.delete(sandbox.id);
-      } catch (err: unknown) {
-        console.warn(
-          `[langchain-kubernetes] KubernetesSandboxManager.shutdown: failed to delete ${sandbox.id}: ${String(err)}`
-        );
-      }
+    try {
+      await this._provider.cleanup();
+    } catch {
+      // Errors are non-fatal during shutdown
     }
   }
-
-  // ── Context manager (async using) ─────────────────────────────────────────
 
   /**
    * Async dispose — called automatically when used with `await using`.
@@ -177,33 +296,4 @@ export class KubernetesSandboxManager {
   async [Symbol.asyncDispose](): Promise<void> {
     await this.shutdown();
   }
-}
-
-// ── Private helpers ────────────────────────────────────────────────────────────
-
-/**
- * Extract `thread_id` from a LangGraph RunnableConfig.
- *
- * Accepts both plain objects and objects with a `configurable` property.
- * Generates a UUID and logs a warning if no `thread_id` is found.
- *
- * @internal
- */
-export function extractThreadId(config: unknown): string {
-  if (config && typeof config === "object") {
-    const cfg = config as RunnableConfig;
-
-    // Plain dict: { configurable: { thread_id: "..." } }
-    if (cfg.configurable && typeof cfg.configurable === "object") {
-      const tid = cfg.configurable["thread_id"];
-      if (typeof tid === "string" && tid) return tid;
-    }
-  }
-
-  const generated = randomUUID();
-  console.warn(
-    `[langchain-kubernetes] No thread_id found in config — generated UUID: ${generated}. ` +
-      'Pass { configurable: { thread_id: "..." } } to associate sandboxes with conversations.'
-  );
-  return generated;
 }

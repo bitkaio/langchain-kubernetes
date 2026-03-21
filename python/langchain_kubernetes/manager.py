@@ -1,11 +1,15 @@
-"""KubernetesSandboxManager: LangGraph-integrated per-thread sandbox manager."""
+"""KubernetesSandboxManager: LangGraph-integrated sandbox lifecycle manager.
+
+Provides a ``create_agent_node()`` factory that generates a LangGraph node
+function managing the full sandbox acquire-or-reconnect cycle. All sandbox
+state is stored in the graph state dict and persisted by LangGraph's
+checkpointer — no Kubernetes label writes or direct cluster API access required.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import threading
-import uuid
 from typing import TYPE_CHECKING, Any, Callable
 
 from langchain_kubernetes.config import KubernetesProviderConfig
@@ -13,53 +17,69 @@ from langchain_kubernetes.provider import KubernetesProvider
 from langchain_kubernetes.sandbox import KubernetesSandbox
 
 if TYPE_CHECKING:
-    pass  # Avoid circular imports; RunnableConfig is imported lazily
+    pass
 
 logger = logging.getLogger(__name__)
 
+# Key used to store sandbox ID in LangGraph graph state by default.
+DEFAULT_SANDBOX_STATE_KEY = "sandbox_id"
+
 
 class KubernetesSandboxManager:
-    """High-level manager that integrates :class:`~langchain_kubernetes.provider.KubernetesProvider`
-    with LangGraph's thread-based execution model.
+    """High-level sandbox manager for LangGraph applications.
 
-    Provides a :attr:`backend_factory` callable suitable for passing to
-    LangGraph's ``create_deep_agent(backend=...)``.  The factory extracts
-    ``thread_id`` from the LangGraph ``RunnableConfig`` and calls
-    :meth:`~KubernetesProvider.get_or_create` with the configured TTL settings,
-    caching sandbox instances so that repeated calls for the same ``thread_id``
-    return the same :class:`~langchain_kubernetes.sandbox.KubernetesSandbox`.
+    Wraps a stateless :class:`~langchain_kubernetes.provider.KubernetesProvider`
+    and provides :meth:`create_agent_node` — a factory that returns a LangGraph
+    node function handling the complete sandbox lifecycle:
 
-    Example::
+    1. Read ``sandbox_id`` from graph state (``None`` on first run).
+    2. Reconnect to the existing sandbox if ``sandbox_id`` is set and the
+       sandbox is still alive.
+    3. Provision a new sandbox if none exists or the previous one expired.
+    4. Run the DeepAgents agent with the sandbox for this invocation.
+    5. Write the (possibly new) ``sandbox_id`` back to graph state so
+       LangGraph's checkpointer persists it for the next run.
 
+    **No state is held in memory.** The ``sandbox_id`` lives exclusively in
+    the LangGraph graph state and is persisted by whichever checkpointer the
+    user configures (``MemorySaver``, ``PostgresSaver``, ``RedisSaver``, …).
+    This means the integration works transparently across process restarts,
+    horizontal scaling, and the LangGraph Platform without any Kubernetes
+    label machinery.
+
+    Example — minimal LangGraph integration::
+
+        from langgraph.graph import StateGraph, END
         from langchain_kubernetes import KubernetesProviderConfig
         from langchain_kubernetes.manager import KubernetesSandboxManager
+        from typing import TypedDict, Annotated
+        from langchain_core.messages import AnyMessage
+        from langgraph.graph.message import add_messages
+
+        class AgentState(TypedDict):
+            messages: Annotated[list[AnyMessage], add_messages]
+            sandbox_id: str | None  # persisted by LangGraph checkpointer
 
         manager = KubernetesSandboxManager(
             KubernetesProviderConfig(
                 mode="agent-sandbox",
                 template_name="python-sandbox-template",
-            ),
-            ttl_seconds=3600,
-            ttl_idle_seconds=600,
+                connection_mode="gateway",
+                gateway_name="my-gateway",
+            )
         )
 
-        # Use with LangGraph create_deep_agent
-        agent = create_deep_agent(
-            model=model,
-            backend=manager.backend_factory,
-        )
-
-        # Or use as a context manager
-        with manager:
-            agent = create_deep_agent(model=model, backend=manager.backend_factory)
+        builder = StateGraph(AgentState)
+        builder.add_node("agent", manager.create_agent_node(model))
+        builder.set_entry_point("agent")
+        builder.add_edge("agent", END)
+        graph = builder.compile(checkpointer=MemorySaver())
 
     Args:
         provider_config: Configuration for the underlying
             :class:`~langchain_kubernetes.provider.KubernetesProvider`.
-        ttl_seconds: Absolute TTL from creation, passed to every
-            :meth:`~KubernetesProvider.get_or_create` call.
-        ttl_idle_seconds: Idle TTL from last execute(), passed to every
-            :meth:`~KubernetesProvider.get_or_create` call.
+        ttl_seconds: Absolute TTL applied to newly created sandboxes.
+        ttl_idle_seconds: Idle TTL applied to newly created sandboxes.
         default_labels: Labels applied to every provisioned sandbox.
     """
 
@@ -74,89 +94,197 @@ class KubernetesSandboxManager:
         self._ttl_seconds = ttl_seconds
         self._ttl_idle_seconds = ttl_idle_seconds
         self._default_labels = default_labels
-        # thread_id -> KubernetesSandbox
-        self._cache: dict[str, KubernetesSandbox] = {}
-        # Guards mutations to _cache and _thread_locks
-        self._lock = threading.Lock()
-        # Per-thread-id locks serialise concurrent provisioning for the same thread.
-        # Without these, N concurrent callers that all miss the cache simultaneously
-        # would each call get_or_create and produce N orphaned sandboxes.
-        self._thread_locks: dict[str, threading.Lock] = {}
 
     # ------------------------------------------------------------------
-    # Public API
+    # Primary integration point: LangGraph node factory
     # ------------------------------------------------------------------
 
-    @property
-    def backend_factory(self) -> Callable[[Any], KubernetesSandbox]:
-        """Return a callable that provisions a per-thread sandbox.
+    def create_agent(
+        self,
+        model: Any,
+        *,
+        checkpointer: Any = None,
+        state_sandbox_key: str = DEFAULT_SANDBOX_STATE_KEY,
+        **create_deep_agent_kwargs: Any,
+    ) -> Any:
+        """Return a compiled DeepAgents graph with automatic per-conversation sandbox management.
 
-        The returned callable accepts a LangGraph ``RunnableConfig`` dict and
-        returns the :class:`~langchain_kubernetes.sandbox.KubernetesSandbox` for
-        that thread.  Repeated calls with the same ``thread_id`` return the
-        same cached sandbox.
-
-        If ``thread_id`` is missing from the config, a UUID is generated and a
-        warning is logged.
-
-        Returns:
-            A sync callable ``(config: RunnableConfig) -> KubernetesSandbox``.
-        """
-
-        def _factory(config: Any) -> KubernetesSandbox:
-            thread_id = _extract_thread_id(config)
-            return self._get_or_create_cached(thread_id)
-
-        return _factory
-
-    async def abackend_factory(self, config: Any) -> KubernetesSandbox:
-        """Async variant of :attr:`backend_factory`.
-
-        Runs the blocking ``get_or_create`` call in the default thread-pool
-        executor so the event loop is never blocked.
+        This is the recommended integration point for most applications. Equivalent to
+        building a :class:`StateGraph` with :meth:`create_agent_node` but without the
+        boilerplate. Invoke with ``config={"configurable": {"thread_id": "..."}}`` to
+        route each conversation to its own persistent sandbox.
 
         Args:
-            config: LangGraph ``RunnableConfig`` dict.
+            model: A LangChain ``BaseChatModel`` passed to ``create_deep_agent()``.
+            checkpointer: LangGraph checkpointer (``MemorySaver``, ``PostgresSaver``,
+                …). Required for multi-turn conversations when calling ``.invoke()``
+                directly (e.g. in FastAPI). The LangGraph Platform / ``langgraph dev``
+                provide their own checkpointer — pass ``None`` there.
+            state_sandbox_key: State field name for the sandbox ID. Defaults to
+                ``"sandbox_id"``. For a custom key, use :meth:`create_agent_node`
+                and build the ``StateGraph`` directly.
+            **create_deep_agent_kwargs: Extra options forwarded to
+                ``create_deep_agent()`` (e.g. ``system_prompt``, ``tools``).
 
         Returns:
-            :class:`~langchain_kubernetes.sandbox.KubernetesSandbox` for the thread.
-        """
-        thread_id = _extract_thread_id(config)
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._get_or_create_cached, thread_id)
+            A compiled LangGraph graph with a single ``"agent"`` node.
 
-    def get_sandbox(self, thread_id: str) -> KubernetesSandbox | None:
-        """Get a cached sandbox by thread_id without creating a new one.
+        Example::
+
+            manager = KubernetesSandboxManager(config)
+
+            # For direct invocation (FastAPI, scripts)
+            agent = manager.create_agent(llm, checkpointer=MemorySaver())
+            result = agent.invoke(
+                {"messages": [("user", "hello")]},
+                config={"configurable": {"thread_id": "conv-1"}},
+            )
+
+            # For langgraph dev / LangGraph Platform — no checkpointer needed
+            graph = manager.create_agent(llm)
+        """
+        from langgraph.graph import StateGraph, END
+        from typing import Annotated
+        from typing_extensions import TypedDict
+        from langchain_core.messages import AnyMessage
+        from langgraph.graph.message import add_messages
+
+        class _AgentState(TypedDict):
+            messages: Annotated[list[AnyMessage], add_messages]
+            sandbox_id: str | None
+
+        node = self.create_agent_node(
+            model, state_sandbox_key=state_sandbox_key, **create_deep_agent_kwargs
+        )
+        builder = StateGraph(_AgentState)
+        builder.add_node("agent", node)
+        builder.set_entry_point("agent")
+        builder.add_edge("agent", END)
+        return builder.compile(checkpointer=checkpointer)
+
+    def create_agent_node(
+        self,
+        model: Any,
+        *,
+        state_sandbox_key: str = DEFAULT_SANDBOX_STATE_KEY,
+        **create_deep_agent_kwargs: Any,
+    ) -> Callable:
+        """Return an async LangGraph node function that manages the sandbox lifecycle.
+
+        The returned node reads ``state[state_sandbox_key]`` to reconnect an
+        existing sandbox or create a new one, runs the DeepAgents agent against
+        the current messages, and returns updated messages plus the (possibly
+        new) ``sandbox_id`` to be stored back in graph state.
+
+        **Graph state requirements** — your ``TypedDict`` must include::
+
+            messages: Annotated[list[AnyMessage], add_messages]
+            sandbox_id: str | None   # or whatever state_sandbox_key you choose
 
         Args:
-            thread_id: Thread / conversation identifier.
+            model: A LangChain ``BaseChatModel`` (or compatible) passed to
+                ``create_deep_agent()``.
+            state_sandbox_key: Name of the graph-state field that holds the
+                sandbox ID. Defaults to ``"sandbox_id"``.
+            **create_deep_agent_kwargs: Extra keyword arguments forwarded to
+                ``create_deep_agent()`` (e.g. ``tools``, ``system_prompt``).
 
         Returns:
-            The cached :class:`~langchain_kubernetes.sandbox.KubernetesSandbox`, or
-            ``None`` if no sandbox exists for this thread.
+            An ``async def agent_node(state, config)`` function suitable for
+            ``StateGraph.add_node()``.
+
+        Example::
+
+            builder.add_node("agent", manager.create_agent_node(
+                model,
+                system_prompt="You are a helpful data analyst.",
+            ))
         """
-        with self._lock:
-            return self._cache.get(thread_id)
+        manager = self  # capture for closure
+
+        async def agent_node(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
+            from deepagents import create_deep_agent
+
+            sandbox_id: str | None = state.get(state_sandbox_key)
+
+            # Acquire sandbox — reconnects if sandbox_id is valid, creates otherwise
+            sandbox = await manager._aget_or_reconnect(sandbox_id)
+
+            # Build a fresh agent bound to this sandbox for the current invocation
+            agent = create_deep_agent(model, backend=sandbox, **create_deep_agent_kwargs)
+
+            messages = state.get("messages", [])
+            result = await agent.ainvoke({"messages": messages}, config or {})
+
+            updates: dict[str, Any] = {"messages": result.get("messages", [])}
+
+            # Persist sandbox_id if it changed (new sandbox was provisioned)
+            if sandbox.id != sandbox_id:
+                updates[state_sandbox_key] = sandbox.id
+
+            return updates
+
+        agent_node.__name__ = "agent_node"
+        return agent_node
+
+    # ------------------------------------------------------------------
+    # Lower-level helper: acquire sandbox from state
+    # ------------------------------------------------------------------
+
+    async def _aget_or_reconnect(self, sandbox_id: str | None) -> KubernetesSandbox:
+        """Reconnect to *sandbox_id* if given and alive, else create a new sandbox.
+
+        Args:
+            sandbox_id: An existing sandbox ID from graph state, or ``None``.
+
+        Returns:
+            :class:`~langchain_kubernetes.sandbox.KubernetesSandbox`. Its ``.id``
+            may differ from *sandbox_id* when a new sandbox was provisioned.
+        """
+        return await self._provider.aget_or_create(
+            sandbox_id=sandbox_id,
+            labels=self._default_labels,
+            ttl_seconds=self._ttl_seconds,
+            ttl_idle_seconds=self._ttl_idle_seconds,
+        )
+
+    # ------------------------------------------------------------------
+    # Operational: cleanup / shutdown
+    # ------------------------------------------------------------------
+
+    def cleanup(self, max_idle_seconds: int | None = None) -> Any:
+        """Delete all managed sandboxes that have exceeded their TTL.
+
+        Delegates to :meth:`~KubernetesProvider.cleanup`, which queries the
+        Kubernetes API directly and removes expired resources.
+
+        Args:
+            max_idle_seconds: Override idle threshold for this call.
+
+        Returns:
+            :class:`~langchain_kubernetes._types.CleanupResult`.
+        """
+        return self._provider.cleanup(max_idle_seconds)
+
+    async def acleanup(self, max_idle_seconds: int | None = None) -> Any:
+        """Async wrapper around :meth:`cleanup`."""
+        return await self._provider.acleanup(max_idle_seconds)
 
     def shutdown(self) -> None:
-        """Delete all tracked sandboxes and clear the internal cache.
+        """Delete all sandboxes managed by this provider instance.
 
-        Calls :meth:`~KubernetesProvider.delete` for each cached sandbox.
-        Errors during deletion are logged but not re-raised.
+        Runs :meth:`cleanup` without an idle threshold, removing all managed
+        sandboxes regardless of their remaining TTL. Useful for tearing down
+        a dev environment or a batch job on exit.
+
+        Errors during individual deletions are logged but not re-raised.
         """
-        with self._lock:
-            sandboxes = list(self._cache.items())
-            self._cache.clear()
-            self._thread_locks.clear()
-
-        for thread_id, sandbox in sandboxes:
-            try:
-                self._provider.delete(sandbox_id=sandbox.id)
-                logger.info("Shutdown: deleted sandbox %s (thread_id=%s)", sandbox.id, thread_id)
-            except Exception as exc:
-                logger.warning(
-                    "Shutdown: failed to delete sandbox %s: %s", sandbox.id, exc
-                )
+        try:
+            result = self._provider.cleanup()
+            if result.deleted:
+                logger.info("Shutdown: deleted sandboxes %s", result.deleted)
+        except Exception as exc:
+            logger.warning("Shutdown: cleanup failed: %s", exc)
 
     async def ashutdown(self) -> None:
         """Async variant of :meth:`shutdown`."""
@@ -177,111 +305,3 @@ class KubernetesSandboxManager:
 
     async def __aexit__(self, *args: Any) -> None:
         await self.ashutdown()
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _get_or_create_cached(self, thread_id: str) -> KubernetesSandbox:
-        """Get from cache or call provider.get_or_create with TTL settings.
-
-        Cache hits are returned immediately with no I/O, safe from any context.
-
-        Cache misses acquire a per-thread-id lock before provisioning.  This
-        serialises concurrent callers for the *same* ``thread_id`` so that
-        only the first caller provisions a sandbox; the rest find it in the
-        cache when they re-check inside the per-thread lock.  Without this,
-        N concurrent async workers (as used by the LangGraph Platform server)
-        would each race to call ``get_or_create`` and create N orphaned
-        sandboxes for the same thread.
-
-        Cache misses also refuse to run if called from inside a running asyncio
-        event loop — use :meth:`abackend_factory` in async contexts instead,
-        which wraps this call in ``loop.run_in_executor``.
-        """
-        # ── Fast path: cache hit, no I/O ─────────────────────────────────────
-        with self._lock:
-            if thread_id in self._cache:
-                return self._cache[thread_id]
-
-        # ── Cache miss: refuse to block the event loop ────────────────────────
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            pass  # no running loop — safe to proceed synchronously
-        else:
-            raise RuntimeError(
-                "KubernetesSandboxManager.backend_factory was called with a cache miss "
-                "from inside a running asyncio event loop. Blocking socket I/O on the "
-                "event loop degrades ASGI servers and is caught by blockbuster in dev mode.\n\n"
-                "Use one of these alternatives:\n"
-                "  1. await manager.abackend_factory(config)  — wraps blocking I/O in a thread\n"
-                "  2. await asyncio.to_thread(manager._get_or_create_cached, thread_id)  — pre-warm\n"
-                "  3. Call manager._get_or_create_cached(thread_id) synchronously before "
-                "starting the event loop (e.g. in lifespan startup)."
-            )
-
-        # ── Acquire per-thread lock to serialise concurrent provisioning ──────
-        # Multiple workers may reach here simultaneously for the same thread_id.
-        # Only one should call get_or_create; the rest must wait and then reuse
-        # the sandbox the winner stored in the cache.
-        with self._lock:
-            if thread_id not in self._thread_locks:
-                self._thread_locks[thread_id] = threading.Lock()
-            thread_lock = self._thread_locks[thread_id]
-
-        with thread_lock:
-            # Re-check: a concurrent caller may have provisioned while we waited
-            with self._lock:
-                if thread_id in self._cache:
-                    return self._cache[thread_id]
-
-            sandbox = self._provider.get_or_create(
-                thread_id=thread_id,
-                labels=self._default_labels,
-                ttl_seconds=self._ttl_seconds,
-                ttl_idle_seconds=self._ttl_idle_seconds,
-            )
-
-            with self._lock:
-                self._cache[thread_id] = sandbox
-
-        return self._cache[thread_id]
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _extract_thread_id(config: Any) -> str:
-    """Extract ``thread_id`` from a LangGraph RunnableConfig.
-
-    Args:
-        config: Dict-like RunnableConfig, or any object with a
-            ``configurable`` attribute.
-
-    Returns:
-        Thread identifier string.  Falls back to a generated UUID if the
-        config does not contain a thread_id.
-    """
-    thread_id: str | None = None
-
-    if isinstance(config, dict):
-        configurable = config.get("configurable", {})
-        if isinstance(configurable, dict):
-            thread_id = configurable.get("thread_id")
-    else:
-        configurable = getattr(config, "configurable", None)
-        if isinstance(configurable, dict):
-            thread_id = configurable.get("thread_id")
-
-    if not thread_id:
-        thread_id = str(uuid.uuid4())
-        logger.warning(
-            "thread_id not found in RunnableConfig — generated UUID %s. "
-            "Pass configurable={'thread_id': '...'} to your LangGraph invocation.",
-            thread_id,
-        )
-
-    return thread_id

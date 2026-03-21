@@ -5,7 +5,7 @@ Kubernetes sandbox provider for the [DeepAgents](https://github.com/langchain-ai
 Supports two backend modes:
 
 | Mode | Requirements | Best for |
-|------|-------------|----------|
+| ---- | ------------ | -------- |
 | **`agent-sandbox`** (default) | [`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox) controller + CRDs | Production — warm pools, gVisor/Kata, sub-second startup |
 | **`raw`** | Any cluster, `@kubernetes/client-node` + `tar-stream` | Dev / clusters where you can't install CRDs |
 
@@ -61,7 +61,7 @@ await provider.delete(sandbox.id);
 ### Shared options
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| ----- | ---- | ------- | ----------- |
 | `mode` | `"agent-sandbox" \| "raw"` | `"agent-sandbox"` | Backend mode |
 | `namespace` | `string` | `"deepagents-sandboxes"` | Kubernetes namespace |
 | `startupTimeoutMs` | `number` | `120_000` | Ms to wait for sandbox to be ready |
@@ -70,7 +70,7 @@ await provider.delete(sandbox.id);
 ### agent-sandbox mode options
 
 | Field | Type | Required | Description |
-|-------|------|----------|-------------|
+| ----- | ---- | -------- | ----------- |
 | `routerUrl` | `string` | Yes | URL of the sandbox-router service |
 | `templateName` | `string` | Yes | `SandboxTemplate` name to instantiate |
 | `serverPort` | `number` | No (8888) | Port the sandbox runtime listens on |
@@ -80,7 +80,7 @@ await provider.delete(sandbox.id);
 ### raw mode options
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| ----- | ---- | ------- | ----------- |
 | `image` | `string` | `"python:3.12-slim"` | Container image |
 | `imagePullPolicy` | `string` | `"IfNotPresent"` | Image pull policy |
 | `workdir` | `string` | `"/workspace"` | Working directory inside container |
@@ -125,7 +125,7 @@ const downloads = await sandbox.downloadFiles(["/workspace/output.txt"]);
 
 ## Usage with DeepAgents
 
-`KubernetesSandbox` implements `SandboxBackendProtocol`, so it plugs directly into
+`KubernetesSandbox` plugs directly into
 [DeepAgents](https://github.com/langchain-ai/deepagents) via the `backend` parameter of
 `createDeepAgent`. When a sandbox backend is set, the agent automatically gains an
 `execute` tool for running shell commands in addition to the standard filesystem tools.
@@ -137,11 +137,10 @@ import { ChatAnthropic } from "@langchain/anthropic";
 import { createDeepAgent } from "deepagents";
 import { KubernetesProvider } from "@bitkaio/langchain-kubernetes";
 
-// Works with either mode — swap the config, nothing else changes
 const provider = new KubernetesProvider({
   routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
-  templateName: "python-sandbox-template",   // agent-sandbox mode
-  // mode: "raw", image: "python:3.12-slim", // raw mode alternative
+  templateName: "python-sandbox-template",
+  // mode: "raw", image: "python:3.12-slim",  // raw mode alternative
 });
 
 const sandbox = await provider.getOrCreate();
@@ -156,98 +155,36 @@ console.log(result.messages.at(-1)?.content);
 await provider.delete(sandbox.id);
 ```
 
-### Per-thread sandbox management (multi-user / multi-turn)
+### Multi-turn: persistent sandbox per conversation
 
-`getOrCreate({ threadId })` is idempotent: it returns the existing sandbox for a thread
-if one is running, and creates one only on the first call. Installed packages, written
-files, and shell state persist between turns on the same thread.
+For multi-turn applications you need the same sandbox to survive across turns — installed
+packages, written files, and shell state must all be retained between messages.
 
-```typescript
-import { ChatAnthropic } from "@langchain/anthropic";
-import { createDeepAgent } from "deepagents";
-import { KubernetesProvider } from "@bitkaio/langchain-kubernetes";
+`KubernetesSandboxManager.createAgent(llm)` returns a ready-to-use DeepAgents agent that
+handles this automatically. Each turn it reconnects to the same sandbox using the
+conversation `thread_id`; if the sandbox has expired it provisions a new one
+transparently.
 
-const provider = new KubernetesProvider({
-  routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
-  templateName: "python-sandbox-template",
-  ttlIdleSeconds: 1800,   // auto-delete sandbox after 30 min of inactivity
-});
-const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
-
-async function handleMessage(threadId: string, userMessage: string): Promise<string> {
-  // Idempotent: reconnects to existing sandbox, creates only on first call
-  const sandbox = await provider.getOrCreate({ threadId, ttlSeconds: 86400 });
-  const agent = createDeepAgent({ model: llm, backend: sandbox });
-
-  const result = await agent.invoke(
-    { messages: [{ role: "user", content: userMessage }] },
-    { configurable: { thread_id: threadId } },  // LangGraph checkpoint key
-  );
-  return result.messages.at(-1)?.content ?? "";
-}
-
-// Both calls run in the same sandbox — state persists between turns
-await handleMessage("user-42-session-7", "Install numpy and create a random 3×3 matrix");
-await handleMessage("user-42-session-7", "Print the matrix you just created");
-```
-
-### `KubernetesSandboxManager` — fully automatic thread wiring
-
-`KubernetesSandboxManager` owns the entire sandbox lifecycle and exposes a
-`backendFactory` callable that `createDeepAgent` accepts as its `backend` argument.
-The factory extracts `threadId` from the LangGraph `RunnableConfig` automatically:
+#### Behind Express / Hono
 
 ```typescript
+import express from "express";
+import { MemorySaver } from "@langchain/langgraph";
 import { ChatAnthropic } from "@langchain/anthropic";
-import { createDeepAgent } from "deepagents";
 import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
 
 const manager = new KubernetesSandboxManager(
   {
     routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
     templateName: "python-sandbox-template",
-    warmPoolName: "python-pool",     // claim from a pre-warmed pool
   },
-  {
-    ttlSeconds: 86400,       // absolute TTL from creation (24 h)
-    ttlIdleSeconds: 1800,    // idle TTL from last execute() (30 min)
-    defaultLabels: { app: "my-chat-service" },
-  },
-);
-
-const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
-
-// backendFactory is (config: RunnableConfig) => Promise<KubernetesSandbox>
-const agent = createDeepAgent({ model: llm, backend: manager.backendFactory });
-
-const result = await agent.invoke(
-  { messages: [{ role: "user", content: "Set up a data pipeline for the iris dataset" }] },
-  { configurable: { thread_id: "session-abc-123" } },
-);
-
-// Second turn — same thread_id → same sandbox, files from turn 1 still there
-const result2 = await agent.invoke(
-  { messages: [{ role: "user", content: "Plot a histogram of petal length" }] },
-  { configurable: { thread_id: "session-abc-123" } },
-);
-
-await manager.asyncShutdown();
-```
-
-#### Express / Hono usage
-
-```typescript
-import express from "express";
-import { ChatAnthropic } from "@langchain/anthropic";
-import { createDeepAgent } from "deepagents";
-import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
-
-const manager = new KubernetesSandboxManager(
-  { routerUrl: "http://sandbox-router-svc:8080", templateName: "python-sandbox-template" },
   { ttlIdleSeconds: 1800 },
 );
 const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
-const agent = createDeepAgent({ model: llm, backend: manager.backendFactory });
+
+// MemorySaver keeps state in-process.
+// Replace with a persistent checkpointer for multi-process deployments.
+const agent = await manager.createAgent(llm, { checkpointer: new MemorySaver() });
 
 const app = express();
 app.use(express.json());
@@ -260,42 +197,43 @@ app.post("/chat/:threadId", async (req, res) => {
   res.json({ reply: result.messages.at(-1)?.content });
 });
 
-process.on("SIGTERM", () => manager.asyncShutdown());
+process.on("SIGTERM", () => manager.shutdown());
 app.listen(3000);
 ```
 
-### Hosting with `langgraph dev` / LangGraph Platform
+Each `thread_id` gets its own sandbox. The first request provisions a new one; every
+subsequent request reconnects to the same one.
 
-When you run DeepAgents via the LangGraph CLI (`langgraph dev`) or deploy to LangGraph
-Platform, the **server** calls the graph for you — you never write `.invoke()` yourself.
-The server creates threads (each with a unique `thread_id`), injects it into
-`config.configurable.thread_id` for every run, and calls your graph.
+#### With `langgraph dev` / LangGraph Platform
 
-`manager.backendFactory` is already designed for this: it receives the `RunnableConfig`
-that the server has already populated, extracts `thread_id`, and routes to the right
-sandbox.
+Yes — **each LangGraph thread automatically gets its own persistent sandbox.**
+`createAgent()` stores the `sandboxId` as a field in graph state. The LangGraph
+Platform (and `langgraph dev`) checkpoint the entire graph state — including
+`sandboxId` — between runs for each thread. When the same thread sends its next
+message, the platform restores the state and the agent reconnects to the same sandbox
+automatically. No extra configuration is needed.
 
-**`agent.ts`** — module-level singletons, export the compiled graph:
+Export the compiled agent from `agent.ts` and point `langgraph.json` at it:
+
+**`agent.ts`:**
 
 ```typescript
 import { ChatAnthropic } from "@langchain/anthropic";
-import { createDeepAgent } from "deepagents";
 import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
 
-// Created once when the server imports this module — not per-request
-export const manager = new KubernetesSandboxManager(
+const manager = new KubernetesSandboxManager(
   {
     routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
     templateName: "python-sandbox-template",
-    warmPoolName: "python-pool",
+    warmPoolName: "python-pool",   // optional: sub-second startup
   },
-  { ttlIdleSeconds: 1800, defaultLabels: { app: "my-langgraph-agent" } },
+  { ttlIdleSeconds: 1800, defaultLabels: { app: "my-agent" } },
 );
 
 const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
 
-// The server points langgraph.json at this export
-export const graph = createDeepAgent({ model: llm, backend: manager.backendFactory });
+// The platform provides the checkpointer — omit it here
+export const graph = await manager.createAgent(llm);
 ```
 
 **`langgraph.json`:**
@@ -313,85 +251,35 @@ npx @langchain/langgraph-cli dev
 # → http://localhost:2024
 ```
 
-Interact via the LangGraph SDK — the server injects `thread_id` automatically:
+Interact via the LangGraph SDK — threads and sandbox persistence are handled automatically:
 
 ```typescript
 import { Client } from "@langchain/langgraph-sdk";
 
 const client = new Client({ apiUrl: "http://localhost:2024" });
-
-// Create a thread — maps 1:1 to a KubernetesSandbox on the first run
 const thread = await client.threads.create();
 
-// First run: manager creates sandbox, labels it with thread_id
+// First run — provisions a sandbox for this thread
 await client.runs.create(thread.thread_id, "agent", {
   input: { messages: [{ role: "user", content: "Install pandas and analyse the iris dataset" }] },
 });
 
-// Second run: manager finds existing sandbox by label selector — same filesystem state
+// Second run — reconnects to the same sandbox automatically
 await client.runs.create(thread.thread_id, "agent", {
   input: { messages: [{ role: "user", content: "Now plot a histogram of petal length" }] },
 });
 ```
 
-### How thread_id flows through the stack
+#### Custom `systemPrompt` and tools
 
-```text
-── Direct .invoke() ──────────────────────────────────────────────────────────
-agent.invoke(input, { configurable: { thread_id: "abc" } })
-  │
-  └─▶ DeepAgents calls backendFactory(toolRuntime)            ─┐
-                                                                │
-── langgraph dev / LangGraph Platform ──────────────────────── │ same path
-POST /runs  { thread_id: "abc", input: {...} }                  │
-  │                                                             │
-  └─▶ Server injects thread_id into RunnableConfig             │
-        └─▶ server calls graph(input, config)                   │
-              └─▶ DeepAgents calls backendFactory(toolRuntime) ─┘
-                    │
-                    └─▶ KubernetesSandboxManager extracts threadId
-                          │
-                          └─▶ provider.getOrCreate({ threadId: "abc", ... })
-                                │
-                                ├─ (first run)   creates Pod/SandboxClaim
-                                │                labels it thread-id=abc
-                                │
-                                └─ (later runs)  finds by label selector
-                                                 reconnects → same sandbox
-```
-
-## Per-thread sandboxes and lifecycle management
-
-### KubernetesSandboxManager (LangGraph integration)
+Extra options passed to `createAgent` are forwarded to `createDeepAgent`:
 
 ```typescript
-import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
-
-const manager = new KubernetesSandboxManager(
-  {
-    mode: "agent-sandbox",
-    routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
-    templateName: "python-sandbox-template",
-  },
-  {
-    ttlSeconds: 3600,         // absolute TTL from creation (seconds)
-    ttlIdleSeconds: 1800,     // idle TTL from last execute() (seconds)
-    defaultLabels: { project: "my-agent", env: "prod" },
-  }
-);
-
-// Pass to LangGraph executor — thread_id is extracted from RunnableConfig automatically
-const factory = manager.backendFactory;
-const sandbox = await factory({ configurable: { thread_id: "conv-abc-123" } });
-
-// Lookup without creating
-const cached = manager.getSandbox("conv-abc-123"); // KubernetesSandbox | undefined
-
-// Cleanup — async dispose (TypeScript 5.2+ "using" keyword)
-await using manager = new KubernetesSandboxManager({ ... });
-
-// Or manual:
-await manager.shutdown();
+const agent = await manager.createAgent(llm, {
+  checkpointer: new MemorySaver(),
+  systemPrompt: "You are a data analyst. Always save outputs to /workspace/output/.",
+  // tools: [myCustomTool],
+});
 ```
 
 **`KubernetesSandboxManagerOptions`:**
@@ -402,38 +290,46 @@ await manager.shutdown();
 | `ttlIdleSeconds` | `number \| undefined` | — | Idle TTL from last `execute()` (seconds) |
 | `defaultLabels` | `Record<string, string> \| undefined` | — | Labels applied to every sandbox (auto-prefixed) |
 
-### Provider API — per-thread getOrCreate
+**Methods:**
+
+| Method | Returns | Description |
+| ------ | ------- | ----------- |
+| `createAgent(model, options?)` | `Promise<CompiledGraph>` | Returns a compiled DeepAgents agent with sandbox persistence (primary integration point) |
+| `createAgentNode(model, options?)` | `AsyncNodeFn` | Returns a single LangGraph node; use when building a multi-node graph |
+| `getOrReconnect(sandboxId)` | `Promise<KubernetesSandbox>` | Reconnect or create; for custom node logic |
+| `cleanup(maxIdleSeconds?)` | `Promise<CleanupResult>` | Delete expired sandboxes |
+| `shutdown()` | `Promise<void>` | Delete all sandboxes |
+| `[Symbol.asyncDispose]()` | `Promise<void>` | Called by `await using` |
+
+## Sandbox lifecycle management
+
+### Provider API — getOrCreate and reconnect
+
+The provider is stateless: it does not cache sandboxes in memory. Callers are responsible
+for persisting `sandbox.id` between calls (LangGraph handles this via its checkpointer).
 
 ```typescript
 // Create new sandbox
 const sandbox = await provider.getOrCreate();
 
-// Idempotent — returns existing sandbox for this thread, or creates a new one
+// Reconnect to an existing sandbox, or create a new one if it no longer exists
 const sandbox = await provider.getOrCreate({
-  threadId: "conv-abc-123",
-  labels: { customer: "acme" },      // auto-prefixed with langchain-kubernetes.bitkaio.com/
+  sandboxId: "existing-id",             // from LangGraph state
+  labels: { customer: "acme" },         // auto-prefixed with langchain-kubernetes.bitkaio.com/
   ttlSeconds: 3600,
   ttlIdleSeconds: 600,
 });
 
-// Reconnect to a specific sandbox by ID (backward-compatible string form)
-const sandbox = await provider.getOrCreate("existing-id");
-
-// Look up without creating
-const existing = await provider.findByThreadId("conv-abc-123"); // undefined if not found
-
 // List all managed sandboxes from the K8s API
 const { sandboxes, cursor } = await provider.list();
-const { sandboxes } = await provider.list({ threadId: "conv-abc-123" });
-const { sandboxes } = await provider.list({ status: "running" });
-const { sandboxes } = await provider.list({ labels: { customer: "acme" } });
+const { sandboxes: running } = await provider.list({ status: "running" });
+const { sandboxes: labelled } = await provider.list({ labels: { customer: "acme" } });
 // Pagination:
 const page2 = await provider.list({ cursor });
 
 // Operational methods
 const result = await provider.cleanup();               // CleanupResult
 const result = await provider.cleanup(300);            // override idle threshold (seconds)
-const stats  = await provider.stats();                 // ProviderStats
 const status = await provider.poolStatus();            // WarmPoolStatus
 
 // Delete (idempotent)
@@ -444,7 +340,7 @@ await provider.delete(sandbox.id);
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `threadId` | `string \| undefined` | Thread/conversation identifier for label-based lookup |
+| `sandboxId` | `string \| undefined` | Existing sandbox ID to reconnect (from graph state) |
 | `labels` | `Record<string, string> \| undefined` | Per-call labels (auto-prefixed) |
 | `ttlSeconds` | `number \| undefined` | Absolute TTL override (seconds) |
 | `ttlIdleSeconds` | `number \| undefined` | Idle TTL override (seconds) |
@@ -460,17 +356,15 @@ interface SandboxListResponse {
 interface SandboxInfo {
   id: string;
   namespace: string;
-  threadId?: string;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
-  createdAt?: string;    // ISO-8601 from langchain-kubernetes.bitkaio.com/created-at
-  lastActivity?: string; // ISO-8601 from langchain-kubernetes.bitkaio.com/last-activity
+  createdAt?: string;    // ISO-8601
   phase?: string;        // Kubernetes Pod phase
   status?: string;       // "running" | "warm" | "pending" | "terminated"
 }
 ```
 
-**`CleanupResult` / `ProviderStats` / `WarmPoolStatus`:**
+**`CleanupResult` / `WarmPoolStatus`:**
 
 ```typescript
 interface CleanupResult {
@@ -478,25 +372,15 @@ interface CleanupResult {
   kept: number;       // sandboxes within their TTL / idle threshold
 }
 
-interface ProviderStats {
-  total: number;
-  running: number;
-  warm: number;
-  idle: number;       // running sandboxes past idleThresholdSeconds (default 300)
-  threadIds: number;  // distinct thread IDs across all sandboxes
-}
-
 interface WarmPoolStatus {
   available: number;  // warm Pods ready to be claimed
-  active: number;     // Pods currently assigned to a thread
+  active: number;     // Pods currently assigned
   total: number;
   target: number;     // configured warmPoolSize
 }
 ```
 
-### New configuration options
-
-The following fields were added to `KubernetesProviderConfig` (both modes unless noted):
+### Additional configuration options
 
 | Field | Type | Default | Description |
 | ----- | ---- | ------- | ----------- |
@@ -582,21 +466,18 @@ const provider = new KubernetesProvider({
 });
 ```
 
-**Local development** — the client needs access to both the sandbox-router and the Kubernetes API. Run two port-forwards:
+**Local development** — forward the sandbox-router to localhost:
 
 ```bash
-# Forward the sandbox-router
 kubectl port-forward svc/sandbox-router-svc 8080:8080 -n default
-
-# Forward kubectl proxy for k8s API access
-kubectl proxy --port=8001
 ```
 
 ```typescript
 const provider = new KubernetesProvider({
   routerUrl: "http://localhost:8080",
   templateName: "python-sandbox-template",
-  kubeApiUrl: "http://localhost:8001", // kubectl proxy — no auth needed
+  // Optional: set kubeApiUrl for sandbox existence verification
+  // kubeApiUrl: "http://localhost:8001",  // kubectl proxy
 });
 ```
 

@@ -3,9 +3,7 @@ import { resolveConfig, validateConfig } from "./config.js";
 import { KubernetesSandbox } from "./sandbox.js";
 import { AgentSandboxBackend } from "./backends/agent-sandbox.js";
 import { RawK8sBackend } from "./backends/raw.js";
-import type { SandboxInfo as AgentSandboxInfo } from "./router-client.js";
 import { SandboxRouterClient, isK8sApiConfigured } from "./router-client.js";
-import type { RawSandboxInfo } from "./backends/raw.js";
 import { SandboxNotFoundError } from "./errors.js";
 import {
   ANN_CREATED_AT,
@@ -15,16 +13,12 @@ import {
   LABEL_PREFIX,
   LK_LABEL_MANAGED_BY,
   LK_LABEL_POOL_STATUS,
-  LK_LABEL_THREAD_ID,
   LK_MANAGED_BY_VALUE,
   LK_MANAGED_SELECTOR,
   POOL_STATUS_ACTIVE,
   POOL_STATUS_WARM,
   buildLabels,
   buildTtlAnnotations,
-  nowIso,
-  sanitizeLabelValue,
-  threadIdSelector,
   warmPoolSelector,
 } from "./labels.js";
 
@@ -32,7 +26,6 @@ import {
 export interface SandboxInfo {
   id: string;
   namespace: string;
-  threadId?: string;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
   createdAt?: string;
@@ -51,7 +44,7 @@ export interface SandboxListResponse {
 export interface CleanupResult {
   /** Sandbox IDs that were deleted. */
   deleted: string[];
-  /** Number of sandboxes that were within their TTL / idle threshold. */
+  /** Number of sandboxes within their TTL / idle threshold. */
   kept: number;
 }
 
@@ -72,33 +65,42 @@ export interface ProviderStats {
   threadIds: number;
 }
 
-/** Options for getOrCreate(). */
+/** Options for {@link KubernetesProvider.getOrCreate}. */
 export interface GetOrCreateOptions {
-  /** Thread/conversation identifier for label-based lookup. */
-  threadId?: string;
-  /** Per-call labels (keys are auto-prefixed). */
+  /**
+   * ID returned by a previous `getOrCreate()` call. Used to reconnect to an
+   * existing sandbox. Pass `undefined` (or omit) for the first call.
+   */
+  sandboxId?: string;
+  /** Labels applied only to *newly created* sandboxes (keys are auto-prefixed). */
   labels?: Record<string, string>;
-  /** Absolute TTL from creation (seconds). Overrides config.ttlSeconds. */
+  /** Absolute TTL from creation (seconds). Overrides `config.ttlSeconds`. */
   ttlSeconds?: number;
-  /** Idle TTL from last execute() (seconds). Overrides config.ttlIdleSeconds. */
+  /** Idle TTL from last execute() (seconds). Overrides `config.ttlIdleSeconds`. */
   ttlIdleSeconds?: number;
 }
 
 /**
- * Manages the lifecycle of Kubernetes sandbox environments.
+ * Stateless lifecycle manager for Kubernetes sandbox environments.
  *
  * Supports two backend modes, selected via `config.mode`:
  *
  * **`agent-sandbox` mode** (default, recommended):
- * - Requires: `routerUrl` and `templateName` in config.
- * - Requires: `kubernetes-sigs/agent-sandbox` controller + CRDs installed.
+ * - Requires `routerUrl` and `templateName` in config.
+ * - Requires `kubernetes-sigs/agent-sandbox` controller + CRDs installed.
  * - Benefits: warm pools, gVisor/Kata isolation, sub-second startup.
  *
  * **`raw` mode** (fallback):
- * - Requires: `@kubernetes/client-node` and `tar-stream` installed.
+ * - Requires `@kubernetes/client-node` and `tar-stream` installed.
  * - Works on any cluster — no CRDs needed.
  *
- * @example
+ * **The provider holds no per-sandbox state.** Every `getOrCreate()` call
+ * returns a {@link KubernetesSandbox} whose `.id` property is the durable
+ * sandbox identifier. Persist this ID in your application state (e.g. LangGraph
+ * graph state) and pass it back as `sandboxId` on the next call to reconnect to
+ * the same sandbox instead of provisioning a new one.
+ *
+ * @example Basic usage
  * ```typescript
  * const provider = new KubernetesProvider({
  *   mode: "agent-sandbox",
@@ -106,19 +108,16 @@ export interface GetOrCreateOptions {
  *   templateName: "python-sandbox-template",
  * });
  *
- * // Per-thread sandbox (idempotent)
- * const sandbox = await provider.getOrCreate({
- *   threadId: "conv-abc-123",
- *   ttlSeconds: 3600,
- * });
+ * // First call — creates a new sandbox
+ * const sandbox = await provider.getOrCreate({ ttlSeconds: 3600 });
+ * const sandboxId = sandbox.id; // persist this in your state
+ *
+ * // Subsequent calls — reconnects to existing sandbox
+ * const same = await provider.getOrCreate({ sandboxId });
  * ```
  */
 export class KubernetesProvider {
   private readonly config: KubernetesProviderConfig;
-  // In-process cache: sandboxId → KubernetesSandbox
-  private readonly sandboxCache = new Map<string, KubernetesSandbox>();
-  // thread_id → sandboxId
-  private readonly threadIdMap = new Map<string, string>();
   private warmPoolInitialised = false;
 
   constructor(config?: Partial<KubernetesProviderConfig>) {
@@ -131,21 +130,23 @@ export class KubernetesProvider {
   /**
    * Get an existing sandbox or create a new one.
    *
-   * When `threadId` is provided, looks for an existing sandbox for that thread
-   * via a Kubernetes label selector before creating a new one.
+   * When `sandboxId` is provided the provider attempts to reconnect to that
+   * sandbox. If it no longer exists (deleted, TTL expired) a new sandbox is
+   * provisioned transparently. Check `sandbox.id` on the returned object —
+   * its value will differ from the `sandboxId` argument if a new one was
+   * provisioned.
    *
-   * @param sandboxIdOrOptions - Existing sandbox ID to reconnect to, or
-   *   an options object `{ threadId?, labels?, ttlSeconds?, ttlIdleSeconds? }`.
-   *   Pass `undefined` to always create new.
+   * Persist `sandbox.id` in your state and pass it back as `sandboxId` on the
+   * next call to reuse the same sandbox across invocations.
+   *
+   * @param options - `{ sandboxId?, labels?, ttlSeconds?, ttlIdleSeconds? }`,
+   *   or a bare sandbox ID string for shorthand reconnect.
    */
   async getOrCreate(
-    sandboxIdOrOptions?: string | GetOrCreateOptions
+    options?: string | GetOrCreateOptions
   ): Promise<KubernetesSandbox> {
     const opts: GetOrCreateOptions =
-      typeof sandboxIdOrOptions === "string"
-        ? {}
-        : (sandboxIdOrOptions ?? {});
-    const sandboxId = typeof sandboxIdOrOptions === "string" ? sandboxIdOrOptions : undefined;
+      typeof options === "string" ? { sandboxId: options } : (options ?? {});
 
     const mode = this.config.mode ?? "agent-sandbox";
 
@@ -155,58 +156,62 @@ export class KubernetesProvider {
       this.replenishWarmPool().catch(() => undefined);
     }
 
-    // Effective TTL values
     const effTtl = opts.ttlSeconds ?? this.config.ttlSeconds;
     const effIdle = opts.ttlIdleSeconds ?? this.config.ttlIdleSeconds;
 
-    // Build merged labels and annotations
     const [extraLabels, extraAnnotations] = buildLabels({
       defaultLabels: this.config.defaultLabels,
       callLabels: opts.labels,
-      threadId: opts.threadId,
     });
-    Object.assign(extraAnnotations, buildTtlAnnotations({
-      ttlSeconds: effTtl,
-      ttlIdleSeconds: effIdle,
-    }));
+    Object.assign(extraAnnotations, buildTtlAnnotations({ ttlSeconds: effTtl, ttlIdleSeconds: effIdle }));
 
-    // Thread_id lookup
-    if (opts.threadId) {
-      const existing = await this.findByThreadIdInternal(opts.threadId, effIdle);
-      if (existing) return existing;
-    }
-
-    // sandbox_id reconnect
-    if (sandboxId) {
-      const cached = this.sandboxCache.get(sandboxId);
-      if (cached) return cached;
-      // Not in cache — delegate to mode-specific reconnect
-      return this.reconnect(sandboxId);
-    }
-
-    // Warm-pool claim (raw mode with threadId)
-    if (mode === "raw" && (this.config.warmPoolSize ?? 0) > 0 && opts.threadId) {
-      const warmSandbox = await this.claimWarmPod(opts.threadId, extraLabels, extraAnnotations, effIdle);
-      if (warmSandbox) {
-        if (opts.threadId) this.threadIdMap.set(opts.threadId, warmSandbox.id);
-        return warmSandbox;
+    // Attempt reconnect if we have an existing sandbox ID
+    if (opts.sandboxId) {
+      try {
+        return await this.reconnect(opts.sandboxId);
+      } catch (err: unknown) {
+        if (err instanceof SandboxNotFoundError) {
+          // Fall through to create a new sandbox
+        } else {
+          throw err;
+        }
       }
     }
 
-    // Create new sandbox
-    const sandbox = await this.create(extraLabels, extraAnnotations, effIdle);
-    if (opts.threadId) this.threadIdMap.set(opts.threadId, sandbox.id);
-    return sandbox;
+    // Claim from warm pool (raw mode only)
+    if (mode === "raw" && (this.config.warmPoolSize ?? 0) > 0) {
+      const warmSandbox = await this.claimWarmPod(extraLabels, extraAnnotations, effIdle);
+      if (warmSandbox) return warmSandbox;
+    }
+
+    // Create a new sandbox
+    return this.create(extraLabels, extraAnnotations, effIdle);
   }
 
   /**
-   * Look up a sandbox by thread identifier without creating one.
+   * Reconnect to an existing sandbox by its ID.
    *
-   * @param threadId - Thread/conversation identifier.
-   * @returns The sandbox if found, otherwise `undefined`.
+   * For raw mode the Pod must still be running; throws {@link SandboxNotFoundError}
+   * otherwise.
+   *
+   * For agent-sandbox mode the SandboxClaim must still exist. When the
+   * Kubernetes API is reachable (`kubeApiUrl` configured or running in-cluster)
+   * the claim is verified before returning; otherwise the backend is returned
+   * optimistically and a missing claim surfaces on the first `execute()` call.
+   *
+   * @param sandboxId - The `sandbox.id` from a previous `getOrCreate()` call.
+   * @throws {SandboxNotFoundError} When the sandbox is confirmed gone.
    */
-  async findByThreadId(threadId: string): Promise<KubernetesSandbox | undefined> {
-    return this.findByThreadIdInternal(threadId, undefined);
+  async reconnect(sandboxId: string): Promise<KubernetesSandbox> {
+    const mode = this.config.mode ?? "agent-sandbox";
+
+    if (mode === "agent-sandbox") {
+      const backend = await AgentSandboxBackend.reconnect(sandboxId, this.config);
+      return new KubernetesSandbox(backend);
+    } else {
+      const backend = await RawK8sBackend.reconnect(sandboxId, this.config);
+      return new KubernetesSandbox(backend);
+    }
   }
 
   /**
@@ -217,7 +222,6 @@ export class KubernetesProvider {
   async list(options?: {
     cursor?: string;
     labels?: Record<string, string>;
-    threadId?: string;
     status?: string;
   }): Promise<SandboxListResponse> {
     const mode = this.config.mode ?? "agent-sandbox";
@@ -229,16 +233,11 @@ export class KubernetesProvider {
 
   /**
    * Delete a sandbox. Idempotent — deleting a non-existent sandbox is a no-op.
-   * After deletion, schedules warm-pool replenishment if enabled.
    *
    * @param sandboxId - The sandbox ID to delete.
    */
   async delete(sandboxId: string): Promise<void> {
     const mode = this.config.mode ?? "agent-sandbox";
-    this.sandboxCache.delete(sandboxId);
-    for (const [tid, sid] of this.threadIdMap.entries()) {
-      if (sid === sandboxId) this.threadIdMap.delete(tid);
-    }
 
     if (mode === "agent-sandbox") {
       await AgentSandboxBackend.deleteSandbox(sandboxId, this.config);
@@ -246,7 +245,7 @@ export class KubernetesProvider {
       await RawK8sBackend.deleteSandbox(sandboxId, this.config);
     }
 
-    // Replenish warm pool
+    // Replenish warm pool after deletion
     if (mode === "raw" && (this.config.warmPoolSize ?? 0) > 0) {
       this.replenishWarmPool().catch(() => undefined);
     }
@@ -267,7 +266,6 @@ export class KubernetesProvider {
       const ann = info.annotations ?? {};
       let shouldDelete = false;
 
-      // Check absolute TTL
       const ttlStr = ann[ANN_TTL_SECONDS];
       const createdStr = ann[ANN_CREATED_AT];
       if (ttlStr && createdStr) {
@@ -278,7 +276,6 @@ export class KubernetesProvider {
         }
       }
 
-      // Check idle TTL
       let idleThreshold = maxIdleSeconds;
       if (idleThreshold === undefined) {
         const idleStr = ann[ANN_TTL_IDLE_SECONDS];
@@ -321,12 +318,10 @@ export class KubernetesProvider {
     const response = await this.list();
     const now = Date.now();
     let running = 0, warm = 0, idle = 0;
-    const threadIds = new Set<string>();
 
     for (const info of response.sandboxes) {
       if (info.status === "running") running++;
       else if (info.status === "warm") warm++;
-      if (info.threadId) threadIds.add(info.threadId);
 
       const lastStr = info.annotations?.[ANN_LAST_ACTIVITY] ?? info.annotations?.[ANN_CREATED_AT];
       if (lastStr && info.status === "running") {
@@ -340,7 +335,7 @@ export class KubernetesProvider {
       running,
       warm,
       idle,
-      threadIds: threadIds.size,
+      threadIds: 0,
     };
   }
 
@@ -362,7 +357,8 @@ export class KubernetesProvider {
         labelSelector: warmPoolSelector(),
       });
       const available = (warmList.items ?? []).filter(
-        (p: { status?: { phase?: string } }) => p.status?.phase === "Running" || p.status?.phase === "Pending"
+        (p: { status?: { phase?: string } }) =>
+          p.status?.phase === "Running" || p.status?.phase === "Pending"
       ).length;
 
       const activeList = await coreApi.listNamespacedPod({
@@ -381,9 +377,8 @@ export class KubernetesProvider {
     }
   }
 
-  // ── Private: create / reconnect ────────────────────────────────────────────
+  // ── Private: create ────────────────────────────────────────────────────────
 
-  /** Create a fresh sandbox. */
   private async create(
     extraLabels?: Record<string, string>,
     extraAnnotations?: Record<string, string>,
@@ -393,145 +388,17 @@ export class KubernetesProvider {
 
     if (mode === "agent-sandbox") {
       const backend = await AgentSandboxBackend.create(this.config, extraLabels, extraAnnotations);
-      const sandbox = new KubernetesSandbox(backend);
-      // Patch claim with thread_id labels/annotations after creation.
-      // Best-effort: enables cross-process reconnection. Skipped when K8s API
-      // is not explicitly configured and not running in-cluster — in that case
-      // the in-process manager cache is the deduplication mechanism.
-      if (
-        isK8sApiConfigured(this.config.kubeApiUrl, this.config.kubeToken) &&
-        extraLabels &&
-        Object.keys(extraLabels).length > 0
-      ) {
-        const client = buildRouterClient(this.config);
-        client.patchSandboxClaim(backend.id, extraLabels, extraAnnotations ?? {}).catch(() => undefined);
-      }
-      // Set up idle activity tracking (also K8s API; silently skipped if not configured).
-      if (ttlIdleSeconds !== undefined && isK8sApiConfigured(this.config.kubeApiUrl, this.config.kubeToken)) {
-        const claimName = backend.id;
-        const client = buildRouterClient(this.config);
-        sandbox.setActivityCallback(() => {
-          client.patchSandboxClaim(claimName, {}, { [ANN_LAST_ACTIVITY]: nowIso() }).catch(() => undefined);
-        });
-      }
-      this.sandboxCache.set(backend.id, sandbox);
-      return sandbox;
+      return new KubernetesSandbox(backend);
     } else {
-      const backend = await RawK8sBackend.create(this.config, undefined, extraLabels, extraAnnotations, ttlIdleSeconds);
-      const sandbox = new KubernetesSandbox(backend);
-      this.sandboxCache.set(backend.id, sandbox);
-      return sandbox;
+      const backend = await RawK8sBackend.create(
+        this.config,
+        undefined,
+        extraLabels,
+        extraAnnotations,
+        ttlIdleSeconds
+      );
+      return new KubernetesSandbox(backend);
     }
-  }
-
-  /** Reconnect to an existing sandbox by ID. */
-  private async reconnect(sandboxId: string): Promise<KubernetesSandbox> {
-    const mode = this.config.mode ?? "agent-sandbox";
-
-    if (mode === "agent-sandbox") {
-      const backend = await AgentSandboxBackend.reconnect(sandboxId, this.config);
-      const sandbox = new KubernetesSandbox(backend);
-      this.sandboxCache.set(sandboxId, sandbox);
-      return sandbox;
-    } else {
-      try {
-        const backend = await RawK8sBackend.reconnect(sandboxId, this.config);
-        const sandbox = new KubernetesSandbox(backend);
-        this.sandboxCache.set(sandboxId, sandbox);
-        return sandbox;
-      } catch (err: unknown) {
-        if (err instanceof SandboxNotFoundError) throw err;
-        throw err;
-      }
-    }
-  }
-
-  // ── Private: thread_id lookup ───────────────────────────────────────────────
-
-  private async findByThreadIdInternal(
-    threadId: string,
-    ttlIdleSeconds: number | undefined
-  ): Promise<KubernetesSandbox | undefined> {
-    // Check in-process cache
-    const cachedId = this.threadIdMap.get(threadId);
-    if (cachedId) {
-      const cached = this.sandboxCache.get(cachedId);
-      if (cached) return cached;
-    }
-
-    const mode = this.config.mode ?? "agent-sandbox";
-    if (mode === "raw") {
-      return this.findByThreadIdRaw(threadId, ttlIdleSeconds);
-    }
-    return this.findByThreadIdAgentSandbox(threadId, ttlIdleSeconds);
-  }
-
-  private async findByThreadIdRaw(
-    threadId: string,
-    ttlIdleSeconds: number | undefined
-  ): Promise<KubernetesSandbox | undefined> {
-    try {
-      const { coreApi, networkingApi } = await this.loadRawClients();
-      const selector = threadIdSelector(threadId);
-      const podList = await coreApi.listNamespacedPod({
-        namespace: this.config.namespace,
-        labelSelector: selector,
-      });
-
-      for (const pod of podList.items ?? []) {
-        if (pod.status?.phase !== "Running") continue;
-        const backend = await RawK8sBackend.reconnect(
-          this.extractRawSandboxId(pod),
-          this.config
-        );
-        if (ttlIdleSeconds !== undefined) {
-          (backend as { ttlIdleSeconds?: number }).ttlIdleSeconds = ttlIdleSeconds;
-        }
-        const sandbox = new KubernetesSandbox(backend);
-        this.sandboxCache.set(backend.id, sandbox);
-        this.threadIdMap.set(threadId, backend.id);
-        return sandbox;
-      }
-    } catch {
-      // Log warning and fall through
-    }
-    return undefined;
-  }
-
-  private async findByThreadIdAgentSandbox(
-    threadId: string,
-    ttlIdleSeconds: number | undefined
-  ): Promise<KubernetesSandbox | undefined> {
-    // K8s label lookup requires direct API access. When not configured (no
-    // kubeApiUrl, no kubeToken, not in-cluster) skip silently — the in-process
-    // manager cache is the deduplication mechanism for this common case.
-    if (!isK8sApiConfigured(this.config.kubeApiUrl, this.config.kubeToken)) {
-      return undefined;
-    }
-    try {
-      const client = buildRouterClient(this.config);
-      const items = await client.listSandboxClaims(threadIdSelector(threadId));
-      for (const item of items) {
-        const obj = item as Record<string, unknown>;
-        const meta = (obj["metadata"] ?? {}) as Record<string, unknown>;
-        const name = (meta["name"] as string | undefined) ?? "";
-        if (!name) continue;
-
-        const backend = await AgentSandboxBackend.reconnect(name, this.config);
-        const sandbox = new KubernetesSandbox(backend);
-        if (ttlIdleSeconds !== undefined) {
-          sandbox.setActivityCallback(() => {
-            client.patchSandboxClaim(name, {}, { [ANN_LAST_ACTIVITY]: nowIso() }).catch(() => undefined);
-          });
-        }
-        this.sandboxCache.set(name, sandbox);
-        this.threadIdMap.set(threadId, name);
-        return sandbox;
-      }
-    } catch {
-      // Fall through
-    }
-    return undefined;
   }
 
   // ── Private: list ──────────────────────────────────────────────────────────
@@ -539,7 +406,6 @@ export class KubernetesProvider {
   private async listRaw(options?: {
     cursor?: string;
     labels?: Record<string, string>;
-    threadId?: string;
     status?: string;
   }): Promise<SandboxListResponse> {
     try {
@@ -550,10 +416,6 @@ export class KubernetesProvider {
         for (const [k, v] of Object.entries(options.labels)) {
           selector += `,${LABEL_PREFIX}${k}=${v}`;
         }
-      }
-      if (options?.threadId) {
-        const [safe] = sanitizeLabelValue(options.threadId);
-        selector += `,${LK_LABEL_THREAD_ID}=${safe}`;
       }
 
       const listResult = await coreApi.listNamespacedPod({
@@ -572,18 +434,13 @@ export class KubernetesProvider {
 
       return { sandboxes, cursor: nextCursor };
     } catch {
-      // Fall back to in-process cache
-      const sandboxes: SandboxInfo[] = Array.from(this.sandboxCache.entries()).map(
-        ([id]) => ({ id, namespace: this.config.namespace, status: "running" })
-      );
-      return { sandboxes };
+      return { sandboxes: [] };
     }
   }
 
   private async listAgentSandbox(options?: {
     cursor?: string;
     labels?: Record<string, string>;
-    threadId?: string;
     status?: string;
   }): Promise<SandboxListResponse> {
     try {
@@ -595,10 +452,6 @@ export class KubernetesProvider {
           selector += `,${LABEL_PREFIX}${k}=${v}`;
         }
       }
-      if (options?.threadId) {
-        const [safe] = sanitizeLabelValue(options.threadId);
-        selector += `,${LK_LABEL_THREAD_ID}=${safe}`;
-      }
 
       const items = await client.listSandboxClaims(selector);
       const sandboxes: SandboxInfo[] = items
@@ -607,18 +460,13 @@ export class KubernetesProvider {
 
       return { sandboxes };
     } catch {
-      // Fall back to in-process cache
-      const sandboxes: SandboxInfo[] = Array.from(this.sandboxCache.entries()).map(
-        ([id]) => ({ id, namespace: this.config.namespace, status: "running" })
-      );
-      return { sandboxes };
+      return { sandboxes: [] };
     }
   }
 
   // ── Private: warm pool ─────────────────────────────────────────────────────
 
   private async claimWarmPod(
-    threadId: string,
     extraLabels: Record<string, string>,
     extraAnnotations: Record<string, string>,
     ttlIdleSeconds: number | undefined
@@ -637,10 +485,8 @@ export class KubernetesProvider {
         const namespace = pod.metadata?.namespace ?? this.config.namespace;
         if (!podName) continue;
 
-        const [safeTid] = sanitizeLabelValue(threadId);
         const patchLabels = {
           ...extraLabels,
-          [LK_LABEL_THREAD_ID]: safeTid,
           [LK_LABEL_POOL_STATUS]: POOL_STATUS_ACTIVE,
         };
 
@@ -650,14 +496,12 @@ export class KubernetesProvider {
           body: { metadata: { labels: patchLabels, annotations: extraAnnotations } },
         });
 
-        const sandboxId = this.extractRawSandboxId(pod);
+        const sandboxId = extractRawSandboxId(pod);
         const backend = await RawK8sBackend.reconnect(sandboxId, this.config);
         if (ttlIdleSeconds !== undefined) {
           (backend as { ttlIdleSeconds?: number }).ttlIdleSeconds = ttlIdleSeconds;
         }
-        const sandbox = new KubernetesSandbox(backend);
-        this.sandboxCache.set(sandboxId, sandbox);
-        return sandbox;
+        return new KubernetesSandbox(backend);
       }
     } catch {
       // Fall through to cold create
@@ -702,23 +546,16 @@ export class KubernetesProvider {
     }
   }
 
-  // ── Private: helpers ────────────────────────────────────────────────────────
+  // ── Private: helpers ───────────────────────────────────────────────────────
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async loadRawClients(): Promise<{ coreApi: any; networkingApi: any }> {
     const { loadK8sClients } = await import("./backends/raw.js");
     return loadK8sClients(this.config);
   }
-
-  private extractRawSandboxId(pod: { metadata?: { name?: string; labels?: Record<string, string> } }): string {
-    const name = pod.metadata?.name ?? "";
-    const labels = pod.metadata?.labels ?? {};
-    const LABEL_SANDBOX_ID = "deepagents.langchain.com/sandbox-id";
-    return labels[LABEL_SANDBOX_ID] ?? name.replace(/^deepagents-/, "");
-  }
 }
 
-// ── Private helpers ────────────────────────────────────────────────────────────
+// ── Module helpers ─────────────────────────────────────────────────────────────
 
 function buildRouterClient(config: KubernetesProviderConfig): SandboxRouterClient {
   return new SandboxRouterClient(config.routerUrl!, {
@@ -730,6 +567,13 @@ function buildRouterClient(config: KubernetesProviderConfig): SandboxRouterClien
   });
 }
 
+function extractRawSandboxId(pod: { metadata?: { name?: string; labels?: Record<string, string> } }): string {
+  const name = pod.metadata?.name ?? "";
+  const labels = pod.metadata?.labels ?? {};
+  const LABEL_SANDBOX_ID = "deepagents.langchain.com/sandbox-id";
+  return labels[LABEL_SANDBOX_ID] ?? name.replace(/^deepagents-/, "");
+}
+
 function podToSandboxInfo(pod: unknown): SandboxInfo {
   const p = pod as Record<string, unknown>;
   const meta = (p["metadata"] ?? {}) as Record<string, unknown>;
@@ -737,12 +581,11 @@ function podToSandboxInfo(pod: unknown): SandboxInfo {
 
   const name = (meta["name"] as string) ?? "unknown";
   const namespace = (meta["namespace"] as string) ?? "default";
-  const labels = ((meta["labels"] as Record<string, string>) ?? {});
-  const annotations = ((meta["annotations"] as Record<string, string>) ?? {});
-  const phase = (status["phase"] as string | undefined);
+  const labels = (meta["labels"] as Record<string, string>) ?? {};
+  const annotations = (meta["annotations"] as Record<string, string>) ?? {};
+  const phase = status["phase"] as string | undefined;
 
   const poolStatus = labels[LK_LABEL_POOL_STATUS];
-  const threadId = labels[LK_LABEL_THREAD_ID];
   const LABEL_SANDBOX_ID = "deepagents.langchain.com/sandbox-id";
   const sandboxId = labels[LABEL_SANDBOX_ID] ?? name.replace(/^deepagents-/, "");
 
@@ -754,13 +597,12 @@ function podToSandboxInfo(pod: unknown): SandboxInfo {
   } else if (phase === "Succeeded" || phase === "Failed") {
     sandboxStatus = "terminated";
   } else {
-    sandboxStatus = (phase?.toLowerCase()) ?? "pending";
+    sandboxStatus = phase?.toLowerCase() ?? "pending";
   }
 
   return {
     id: sandboxId,
     namespace,
-    threadId,
     labels,
     annotations,
     createdAt: annotations[ANN_CREATED_AT],
@@ -772,13 +614,11 @@ function podToSandboxInfo(pod: unknown): SandboxInfo {
 
 function claimToSandboxInfo(item: unknown, defaultNamespace: string): SandboxInfo {
   const obj = (item as Record<string, unknown>) ?? {};
-  const meta = ((obj["metadata"] as Record<string, unknown>) ?? {});
+  const meta = (obj["metadata"] as Record<string, unknown>) ?? {};
   const name = (meta["name"] as string) ?? "unknown";
   const namespace = (meta["namespace"] as string) ?? defaultNamespace;
-  const labels = ((meta["labels"] as Record<string, string>) ?? {});
-  const annotations = ((meta["annotations"] as Record<string, string>) ?? {});
-
-  const threadId = labels[LK_LABEL_THREAD_ID];
+  const labels = (meta["labels"] as Record<string, string>) ?? {};
+  const annotations = (meta["annotations"] as Record<string, string>) ?? {};
 
   const statusObj = (obj["status"] as Record<string, unknown> | undefined) ?? {};
   const conditions = (statusObj["conditions"] as unknown[]) ?? [];
@@ -790,7 +630,6 @@ function claimToSandboxInfo(item: unknown, defaultNamespace: string): SandboxInf
   return {
     id: name,
     namespace,
-    threadId,
     labels,
     annotations,
     createdAt: annotations[ANN_CREATED_AT],
