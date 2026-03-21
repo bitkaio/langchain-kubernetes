@@ -1,6 +1,5 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { KubernetesSandboxManager, extractThreadId } from "../../src/manager.js";
-import { KubernetesProvider } from "../../src/provider.js";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { KubernetesSandboxManager } from "../../src/manager.js";
 import { KubernetesSandbox } from "../../src/sandbox.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -13,100 +12,45 @@ function makeMockSandbox(id: string): KubernetesSandbox {
   return { id } as unknown as KubernetesSandbox;
 }
 
-function makeManager(options = {}) {
+function makeManager(options: Record<string, unknown> = {}) {
   return new KubernetesSandboxManager(rawConfig(), options);
 }
 
-// ── extractThreadId ────────────────────────────────────────────────────────────
+afterEach(() => vi.restoreAllMocks());
 
-describe("extractThreadId", () => {
-  it("extracts from { configurable: { thread_id } }", () => {
-    const result = extractThreadId({ configurable: { thread_id: "my-thread" } });
-    expect(result).toBe("my-thread");
-  });
+// ── getOrReconnect ─────────────────────────────────────────────────────────────
 
-  it("generates UUID when config is empty object", () => {
-    const result = extractThreadId({});
-    expect(result).toMatch(/^[0-9a-f-]{36}$/);
-  });
-
-  it("generates UUID when configurable has no thread_id", () => {
-    const result = extractThreadId({ configurable: { other_key: "value" } });
-    expect(result).toMatch(/^[0-9a-f-]{36}$/);
-  });
-
-  it("generates UUID when config is null", () => {
-    const result = extractThreadId(null);
-    expect(result).toMatch(/^[0-9a-f-]{36}$/);
-  });
-
-  it("generates UUID when config is a string", () => {
-    const result = extractThreadId("not-an-object");
-    expect(result).toMatch(/^[0-9a-f-]{36}$/);
-  });
-
-  it("returns empty string thread_id as UUID (falsy guard)", () => {
-    const result = extractThreadId({ configurable: { thread_id: "" } });
-    expect(result).toMatch(/^[0-9a-f-]{36}$/);
-  });
-});
-
-// ── backendFactory / abackendFactory ──────────────────────────────────────────
-
-describe("KubernetesSandboxManager.backendFactory", () => {
-  let manager: KubernetesSandboxManager;
-
-  beforeEach(() => {
-    manager = makeManager();
-  });
-
-  it("creates a sandbox for a thread_id", async () => {
+describe("KubernetesSandboxManager.getOrReconnect", () => {
+  it("delegates to provider.getOrCreate with the given sandboxId", async () => {
+    const manager = makeManager();
     const mockSandbox = makeMockSandbox("sb-001");
-    vi.spyOn(manager._provider, "getOrCreate").mockResolvedValue(mockSandbox);
+    const spy = vi.spyOn(manager._provider, "getOrCreate").mockResolvedValue(mockSandbox);
 
-    const factory = manager.backendFactory;
-    const result = await factory({ configurable: { thread_id: "thread-1" } });
+    const result = await manager.getOrReconnect("sb-001");
+
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ sandboxId: "sb-001" }));
     expect(result.id).toBe("sb-001");
   });
 
-  it("caches: same thread_id returns same sandbox, calls getOrCreate once", async () => {
-    const mockSandbox = makeMockSandbox("sb-cached");
+  it("passes undefined sandboxId when none given (new sandbox)", async () => {
+    const manager = makeManager();
+    const mockSandbox = makeMockSandbox("new-sb");
     const spy = vi.spyOn(manager._provider, "getOrCreate").mockResolvedValue(mockSandbox);
 
-    const factory = manager.backendFactory;
-    const r1 = await factory({ configurable: { thread_id: "same-thread" } });
-    const r2 = await factory({ configurable: { thread_id: "same-thread" } });
+    await manager.getOrReconnect(undefined);
 
-    expect(r1).toBe(r2);
-    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({ sandboxId: undefined }));
   });
 
-  it("different thread_ids produce different sandboxes", async () => {
-    const sb1 = makeMockSandbox("sb-thread-1");
-    const sb2 = makeMockSandbox("sb-thread-2");
-
-    vi.spyOn(manager._provider, "getOrCreate")
-      .mockResolvedValueOnce(sb1)
-      .mockResolvedValueOnce(sb2);
-
-    const factory = manager.backendFactory;
-    const r1 = await factory({ configurable: { thread_id: "thread-1" } });
-    const r2 = await factory({ configurable: { thread_id: "thread-2" } });
-
-    expect(r1.id).toBe("sb-thread-1");
-    expect(r2.id).toBe("sb-thread-2");
-    expect(r1).not.toBe(r2);
-  });
-
-  it("passes ttl_seconds and ttl_idle_seconds to getOrCreate", async () => {
-    const managerWithTtl = new KubernetesSandboxManager(rawConfig(), {
+  it("forwards ttlSeconds and ttlIdleSeconds to provider", async () => {
+    const manager = new KubernetesSandboxManager(rawConfig(), {
       ttlSeconds: 3600,
       ttlIdleSeconds: 600,
     });
     const mockSandbox = makeMockSandbox("ttl-sb");
-    const spy = vi.spyOn(managerWithTtl._provider, "getOrCreate").mockResolvedValue(mockSandbox);
+    const spy = vi.spyOn(manager._provider, "getOrCreate").mockResolvedValue(mockSandbox);
 
-    await managerWithTtl.abackendFactory({ configurable: { thread_id: "ttl-thread" } });
+    await manager.getOrReconnect(undefined);
 
     expect(spy).toHaveBeenCalledWith(expect.objectContaining({
       ttlSeconds: 3600,
@@ -114,106 +58,86 @@ describe("KubernetesSandboxManager.backendFactory", () => {
     }));
   });
 
-  it("passes defaultLabels to getOrCreate", async () => {
-    const managerWithLabels = new KubernetesSandboxManager(rawConfig(), {
-      defaultLabels: { env: "test" },
+  it("forwards defaultLabels to provider", async () => {
+    const manager = new KubernetesSandboxManager(rawConfig(), {
+      defaultLabels: { env: "prod" },
     });
     const mockSandbox = makeMockSandbox("label-sb");
-    const spy = vi.spyOn(managerWithLabels._provider, "getOrCreate").mockResolvedValue(mockSandbox);
-
-    await managerWithLabels.abackendFactory({ configurable: { thread_id: "label-thread" } });
-
-    expect(spy).toHaveBeenCalledWith(expect.objectContaining({
-      labels: { env: "test" },
-    }));
-  });
-
-  it("generates UUID thread_id when config has none", async () => {
-    const mockSandbox = makeMockSandbox("uuid-sb");
     const spy = vi.spyOn(manager._provider, "getOrCreate").mockResolvedValue(mockSandbox);
 
-    const result = await manager.abackendFactory({});
-    expect(result).toBeDefined();
-    const callArgs = spy.mock.calls[0][0] as { threadId: string };
-    expect(callArgs.threadId).toMatch(/^[0-9a-f-]{36}$/);
+    await manager.getOrReconnect(undefined);
+
+    expect(spy).toHaveBeenCalledWith(expect.objectContaining({
+      labels: { env: "prod" },
+    }));
   });
 });
 
-// ── getSandbox ─────────────────────────────────────────────────────────────────
+// ── createAgentNode ────────────────────────────────────────────────────────────
 
-describe("KubernetesSandboxManager.getSandbox", () => {
-  it("returns cached sandbox for a known thread_id", async () => {
+describe("KubernetesSandboxManager.createAgentNode", () => {
+  it("returns a function", () => {
     const manager = makeManager();
-    const mockSandbox = makeMockSandbox("cached");
-    vi.spyOn(manager._provider, "getOrCreate").mockResolvedValue(mockSandbox);
-
-    await manager.abackendFactory({ configurable: { thread_id: "known-thread" } });
-    expect(manager.getSandbox("known-thread")).toBe(mockSandbox);
+    const node = manager.createAgentNode({} as never);
+    expect(typeof node).toBe("function");
   });
 
-  it("returns undefined for an unknown thread_id", () => {
+  it("accepts a custom stateSandboxKey option", () => {
     const manager = makeManager();
-    expect(manager.getSandbox("unknown")).toBeUndefined();
+    const node = manager.createAgentNode({} as never, { stateSandboxKey: "myKey" });
+    expect(typeof node).toBe("function");
   });
 });
 
 // ── shutdown ───────────────────────────────────────────────────────────────────
 
 describe("KubernetesSandboxManager.shutdown", () => {
-  it("deletes all cached sandboxes", async () => {
+  it("calls provider.cleanup()", async () => {
     const manager = makeManager();
-    const sb1 = makeMockSandbox("sb-1");
-    const sb2 = makeMockSandbox("sb-2");
-
-    vi.spyOn(manager._provider, "getOrCreate")
-      .mockResolvedValueOnce(sb1)
-      .mockResolvedValueOnce(sb2);
-
-    await manager.abackendFactory({ configurable: { thread_id: "t1" } });
-    await manager.abackendFactory({ configurable: { thread_id: "t2" } });
-
-    const deletedIds: string[] = [];
-    vi.spyOn(manager._provider, "delete").mockImplementation(async (id) => {
-      deletedIds.push(id);
-    });
+    const spy = vi.spyOn(manager._provider, "cleanup").mockResolvedValue({ deleted: [], kept: 0 });
 
     await manager.shutdown();
-    expect(new Set(deletedIds)).toEqual(new Set(["sb-1", "sb-2"]));
+
+    expect(spy).toHaveBeenCalledOnce();
   });
 
-  it("clears the internal cache after shutdown", async () => {
+  it("does not throw when cleanup fails", async () => {
     const manager = makeManager();
-    const mockSb = makeMockSandbox("sb-1");
-    vi.spyOn(manager._provider, "getOrCreate").mockResolvedValue(mockSb);
-    vi.spyOn(manager._provider, "delete").mockResolvedValue();
+    vi.spyOn(manager._provider, "cleanup").mockRejectedValue(new Error("k8s error"));
 
-    await manager.abackendFactory({ configurable: { thread_id: "t1" } });
-    expect(manager.getSandbox("t1")).toBeDefined();
-
-    await manager.shutdown();
-    expect(manager.getSandbox("t1")).toBeUndefined();
-  });
-
-  it("continues shutdown on individual delete errors", async () => {
-    const manager = makeManager();
-    const sb1 = makeMockSandbox("fail-sb");
-    vi.spyOn(manager._provider, "getOrCreate").mockResolvedValue(sb1);
-    vi.spyOn(manager._provider, "delete").mockRejectedValue(new Error("delete failed"));
-
-    await manager.abackendFactory({ configurable: { thread_id: "t-err" } });
-    await expect(manager.shutdown()).resolves.toBeUndefined(); // no throw
+    await expect(manager.shutdown()).resolves.toBeUndefined();
   });
 
   it("Symbol.asyncDispose calls shutdown", async () => {
     const manager = makeManager();
     const spy = vi.spyOn(manager, "shutdown").mockResolvedValue();
+
     await manager[Symbol.asyncDispose]();
+
     expect(spy).toHaveBeenCalledOnce();
   });
 });
 
-// ── Cleanup ────────────────────────────────────────────────────────────────────
+// ── cleanup ────────────────────────────────────────────────────────────────────
 
-afterEach(() => {
-  vi.restoreAllMocks();
+describe("KubernetesSandboxManager.cleanup", () => {
+  it("delegates to provider.cleanup()", async () => {
+    const manager = makeManager();
+    const mockResult = { deleted: ["sb-1"], kept: 0 };
+    const spy = vi.spyOn(manager._provider, "cleanup").mockResolvedValue(mockResult);
+
+    const result = await manager.cleanup();
+
+    expect(spy).toHaveBeenCalledOnce();
+    expect(result).toBe(mockResult);
+  });
+
+  it("passes maxIdleSeconds to provider.cleanup()", async () => {
+    const manager = makeManager();
+    const spy = vi.spyOn(manager._provider, "cleanup").mockResolvedValue({ deleted: [], kept: 0 });
+
+    await manager.cleanup(600);
+
+    expect(spy).toHaveBeenCalledWith(600);
+  });
 });
