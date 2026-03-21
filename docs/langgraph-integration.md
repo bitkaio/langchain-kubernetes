@@ -1,6 +1,14 @@
 # LangGraph Integration Guide
 
-This guide shows how to integrate `langchain-kubernetes` with LangGraph so that each conversation thread gets its own isolated sandbox.
+This guide shows how to integrate `langchain-kubernetes` with LangGraph and DeepAgents so that each conversation thread gets its own isolated, persistent sandbox.
+
+## How per-thread sandbox persistence works
+
+`KubernetesSandboxManager.create_agent()` / `createAgent()` returns a compiled LangGraph+DeepAgents graph that stores the `sandbox_id` as a field in graph state. The LangGraph checkpointer (or LangGraph Platform's built-in one) persists the entire graph state — including `sandbox_id` — between runs for each thread. When the same thread sends its next message, the state is restored and the agent reconnects to the same sandbox automatically.
+
+No Kubernetes label writes are required for this. The `KubernetesSandboxManager` itself is stateless — it holds no in-process sandbox cache.
+
+---
 
 ## Python
 
@@ -11,68 +19,111 @@ pip install langchain-kubernetes[agent-sandbox]   # agent-sandbox mode
 pip install langchain-kubernetes[raw]             # raw mode (no CRDs)
 ```
 
-### Using KubernetesSandboxManager as a LangGraph backend factory
+### FastAPI
 
-The `KubernetesSandboxManager` wraps `KubernetesProvider` and exposes a `backend_factory` callable that LangGraph's executor can use to resolve a sandbox per thread.
+Pass a `checkpointer` to `create_agent()`. Each HTTP request provides a `thread_id` in the LangGraph config; the checkpointer persists the graph state (including `sandbox_id`) between requests.
 
 ```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from langchain_anthropic import ChatAnthropic
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_kubernetes import KubernetesSandboxManager, KubernetesProviderConfig
 
-# Agent-sandbox mode (recommended)
 manager = KubernetesSandboxManager(
     KubernetesProviderConfig(
-        mode="agent-sandbox",
         template_name="python-sandbox-template",
-        # router is auto-discovered in-cluster; set for local dev:
-        # api_url="http://localhost:8001",
+        warm_pool_name="python-pool",   # optional: sub-second startup
     ),
-    ttl_seconds=3600,         # absolute TTL: reclaim after 1h
-    ttl_idle_seconds=1800,    # idle TTL: reclaim after 30min of no activity
-    default_labels={"project": "my-agent", "env": "prod"},
+    ttl_seconds=86400,
+    ttl_idle_seconds=1800,
+    default_labels={"app": "my-agent"},
+)
+llm = ChatAnthropic(model="claude-opus-4-6")
+agent = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global agent
+    agent = manager.create_agent(llm, checkpointer=MemorySaver())
+    yield
+    await manager.ashutdown()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/chat/{thread_id}")
+async def chat(thread_id: str, message: str):
+    result = await agent.ainvoke(
+        {"messages": [("user", message)]},
+        config={"configurable": {"thread_id": thread_id}},
+    )
+    return {"reply": result["messages"][-1].content}
+```
+
+For production, swap `MemorySaver()` for a persistent checkpointer (e.g., `PostgresSaver`, `RedisSaver`) so state survives process restarts.
+
+### Python — `langgraph dev` / LangGraph Platform
+
+Omit `checkpointer` — the Platform provides its own. Export the compiled graph and point `langgraph.json` at it:
+
+**`agent.py`:**
+
+```python
+from langchain_anthropic import ChatAnthropic
+from langchain_kubernetes import KubernetesSandboxManager, KubernetesProviderConfig
+
+manager = KubernetesSandboxManager(
+    KubernetesProviderConfig(
+        template_name="python-sandbox-template",
+        warm_pool_name="python-pool",
+    ),
+    ttl_idle_seconds=1800,
+    default_labels={"app": "my-agent"},
 )
 
-# Pass to LangGraph executor
-executor = SandboxedExecutor(backend_factory=manager.backend_factory)
+llm = ChatAnthropic(model="claude-opus-4-6")
+graph = manager.create_agent(llm)   # platform provides the checkpointer
 ```
 
-LangGraph passes a `RunnableConfig` dict (with `configurable.thread_id`) to the factory. The manager extracts the thread ID, looks up an existing sandbox or creates a new one, and caches it for subsequent calls within the same process.
+**`langgraph.json`:**
 
-### Async usage
-
-```python
-# In an async context, use abackend_factory directly:
-sandbox = await manager.abackend_factory({"configurable": {"thread_id": "conv-abc-123"}})
-result = await sandbox.aexecute("python3 -c 'print(42)'")
+```json
+{
+    "dependencies": ["."],
+    "graphs": {
+        "agent": "./agent.py:graph"
+    }
+}
 ```
 
-### Cleanup
-
-```python
-# Context manager (sync):
-with KubernetesSandboxManager(config) as manager:
-    ...
-# all sandboxes are deleted on exit
-
-# Context manager (async):
-async with KubernetesSandboxManager(config) as manager:
-    ...
-
-# Manual:
-manager.shutdown()         # sync
-await manager.ashutdown()  # async
+```bash
+pip install "langgraph-cli[inmem]"
+langgraph dev   # → http://localhost:2024
 ```
 
-### Thread-ID lookup and per-conversation persistence
+Each LangGraph thread automatically gets and retains its own sandbox.
 
-Once a sandbox is created for a `thread_id`, subsequent calls with the same ID return the same sandbox — without hitting the Kubernetes API — via an in-process cache.
+### Inside a larger StateGraph
 
-If the process restarts, the sandbox is looked up by Kubernetes label selector (`langchain-kubernetes.bitkaio.com/thread-id=<hash>`) on the next call.
+Use `create_agent_node()` to embed the DeepAgents sandbox agent as a node inside your own graph:
 
 ```python
-# Explicit lookup (no creation)
-sandbox = provider.find_by_thread_id("conv-abc-123")
-if sandbox:
-    sandbox.execute("echo still here")
+from langgraph.graph import StateGraph, END
+from typing import Annotated
+from typing_extensions import TypedDict
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
+class MyState(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    sandbox_id: str | None
+    # ... your other state fields
+
+sandbox_node = manager.create_agent_node(llm)
+
+builder = StateGraph(MyState)
+builder.add_node("sandbox_agent", sandbox_node)
+# ... add your other nodes
 ```
 
 ### TTL and auto-cleanup
@@ -80,19 +131,17 @@ if sandbox:
 Sandboxes carry annotations set at creation time:
 
 | Annotation | Meaning |
-|---|---|
+| --- | --- |
 | `langchain-kubernetes.bitkaio.com/ttl-seconds` | Absolute TTL from `created-at` |
 | `langchain-kubernetes.bitkaio.com/ttl-idle-seconds` | Idle TTL from `last-activity` |
 | `langchain-kubernetes.bitkaio.com/created-at` | ISO-8601 creation timestamp |
-| `langchain-kubernetes.bitkaio.com/last-activity` | Updated after each execute() |
-
-The provider's `cleanup()` method enforces these TTLs:
+| `langchain-kubernetes.bitkaio.com/last-activity` | Updated after each `execute()` |
 
 ```python
 result = provider.cleanup()
 print(f"Deleted: {result.deleted}, Kept: {result.kept}")
 
-# Or with an explicit idle threshold:
+# With an explicit idle threshold:
 result = provider.cleanup(max_idle_seconds=600)
 ```
 
@@ -109,76 +158,67 @@ npm install @bitkaio/langchain-kubernetes
 npm install @kubernetes/client-node tar-stream   # raw mode only
 ```
 
-### Using KubernetesSandboxManager
+### Express
 
 ```typescript
+import express from "express";
+import { MemorySaver } from "@langchain/langgraph";
+import { ChatAnthropic } from "@langchain/anthropic";
 import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
 
 const manager = new KubernetesSandboxManager(
   {
-    mode: "agent-sandbox",
     routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
     templateName: "python-sandbox-template",
+    warmPoolName: "python-pool",
   },
+  { ttlSeconds: 86400, ttlIdleSeconds: 1800, defaultLabels: { app: "my-agent" } },
+);
+const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
+const agent = await manager.createAgent(llm, { checkpointer: new MemorySaver() });
+
+const app = express();
+app.use(express.json());
+app.post("/chat/:threadId", async (req, res) => {
+  const result = await agent.invoke(
+    { messages: [{ role: "user", content: req.body.message }] },
+    { configurable: { thread_id: req.params.threadId } },
+  );
+  res.json({ reply: result.messages.at(-1)?.content });
+});
+process.on("SIGTERM", () => manager.shutdown());
+app.listen(3000);
+```
+
+### TypeScript — `langgraph dev` / LangGraph Platform
+
+**`agent.ts`:**
+
+```typescript
+import { ChatAnthropic } from "@langchain/anthropic";
+import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
+
+const manager = new KubernetesSandboxManager(
   {
-    ttlSeconds: 3600,
-    ttlIdleSeconds: 1800,
-    defaultLabels: { project: "my-agent", env: "prod" },
-  }
+    routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
+    templateName: "python-sandbox-template",
+    warmPoolName: "python-pool",
+  },
+  { ttlIdleSeconds: 1800, defaultLabels: { app: "my-agent" } },
 );
 
-// Pass to your executor:
-const factory = manager.backendFactory;
-const sandbox = await factory({ configurable: { thread_id: "conv-abc-123" } });
-await sandbox.execute("python3 -c 'print(42)'");
+// Omit checkpointer — the platform provides its own
+export const graph = await manager.createAgent(new ChatAnthropic({ model: "claude-opus-4-6" }));
 ```
 
-### Async cleanup with `await using`
+**`langgraph.json`:**
 
-TypeScript 5.2+ supports the `using` statement for async resource management:
-
-```typescript
-await using manager = new KubernetesSandboxManager({ ... });
-// sandbox cleanup happens automatically when the block exits
+```json
+{ "graphs": { "agent": "./agent.ts:graph" } }
 ```
 
-Or manually:
-
-```typescript
-await manager.shutdown();
-```
-
-### Low-level provider usage
-
-```typescript
-import { KubernetesProvider } from "@bitkaio/langchain-kubernetes";
-
-const provider = new KubernetesProvider({
-  mode: "agent-sandbox",
-  routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
-  templateName: "python-sandbox-template",
-  ttlSeconds: 3600,
-  ttlIdleSeconds: 900,
-});
-
-// Create / look up by thread:
-const sandbox = await provider.getOrCreate({
-  threadId: "conv-abc-123",
-  labels: { customer: "acme" },
-});
-
-// Find existing (no creation):
-const existing = await provider.findByThreadId("conv-abc-123");
-
-// List all sandboxes:
-const { sandboxes, cursor } = await provider.list({ status: "running" });
-
-// Stats:
-const stats = await provider.stats();
-console.log(`Total: ${stats.total}, Warm: ${stats.warm}, Idle: ${stats.idle}`);
-
-// Cleanup:
-const result = await provider.cleanup(600);  // idle > 10 min
+```bash
+npx @langchain/langgraph-cli dev   # → http://localhost:2024
 ```
 
 ---
@@ -188,28 +228,39 @@ const result = await provider.cleanup(600);  // idle > 10 min
 For local development without a full cluster, use `kubectl port-forward`:
 
 ```bash
-# agent-sandbox mode
+# Expose the sandbox-router
 kubectl port-forward svc/sandbox-router-svc 8080:8080
 
-# Then set routerUrl: "http://localhost:8080"
-# And kubeApiUrl: "http://localhost:8001" (kubectl proxy)
+# Expose the Kubernetes API (for optional reconnect verification)
+kubectl proxy --port=8001
 ```
 
-For raw mode, point at any accessible cluster via kubeconfig:
+Then configure:
 
 ```python
 config = KubernetesProviderConfig(
-    mode="raw",
-    image="python:3.12-slim",
-    namespace="default",
+    template_name="python-sandbox-template",
+    # routerUrl defaults to in-cluster; override for local dev:
+    # connection_mode="direct",
+    # api_url="http://localhost:8001",
 )
 ```
+
+```typescript
+const manager = new KubernetesSandboxManager({
+  routerUrl: "http://localhost:8080",
+  templateName: "python-sandbox-template",
+  kubeApiUrl: "http://localhost:8001",   // optional: enables reconnect verification
+});
+```
+
+For raw mode, point at any accessible cluster via kubeconfig — no extra port-forwarding needed.
 
 ---
 
 ## Security Notes
 
-- All sandboxes created by this provider carry the label `langchain-kubernetes.bitkaio.com/managed-by=langchain-kubernetes` for easy RBAC scoping.
-- Raw mode enforces network isolation via a deny-all `NetworkPolicy` by default (`blockNetwork=True`/`blockNetwork: true`).
+- All sandboxes carry the label `langchain-kubernetes.bitkaio.com/managed-by=langchain-kubernetes` for easy RBAC scoping and `kubectl` queries.
+- Raw mode enforces network isolation via a deny-all `NetworkPolicy` by default (`block_network=True` / `blockNetwork: true`).
 - For regulated environments (OpenShift, PCI-DSS, etc.), see [openshift.md](./openshift.md).
 - Use gVisor or Kata Containers runtime classes in agent-sandbox mode for kernel-level isolation.
