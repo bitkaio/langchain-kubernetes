@@ -26,6 +26,7 @@ import {
 export interface SandboxInfo {
   id: string;
   namespace: string;
+  threadId?: string;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
   createdAt?: string;
