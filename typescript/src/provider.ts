@@ -318,10 +318,13 @@ export class KubernetesProvider {
     const response = await this.list();
     const now = Date.now();
     let running = 0, warm = 0, idle = 0;
+    const threadIdSet = new Set<string>();
 
     for (const info of response.sandboxes) {
       if (info.status === "running") running++;
       else if (info.status === "warm") warm++;
+
+      if (info.threadId) threadIdSet.add(info.threadId);
 
       const lastStr = info.annotations?.[ANN_LAST_ACTIVITY] ?? info.annotations?.[ANN_CREATED_AT];
       if (lastStr && info.status === "running") {
@@ -335,7 +338,7 @@ export class KubernetesProvider {
       running,
       warm,
       idle,
-      threadIds: 0,
+      threadIds: threadIdSet.size,
     };
   }
 

@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from langchain_kubernetes._provider_base import SandboxNotFoundError
+from langchain_kubernetes._types import SandboxInfo, SandboxListResponse
 from langchain_kubernetes.config import KubernetesProviderConfig
 from langchain_kubernetes.provider import (
     KubernetesProvider,
@@ -87,23 +88,25 @@ class TestGetOrCreateAgentSandbox:
         assert sandbox.id == "claim-abc"
 
     def test_reconnect_to_active_sandbox(self):
+        """get_or_create(sandbox_id=...) reconnects and returns sandbox with correct id."""
         provider = KubernetesProvider(_agent_sandbox_config())
         mock_client = _make_mock_sandbox_client("active-sandbox")
 
         with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=mock_client):
-            sb1 = provider.get_or_create()
+            sb = provider.get_or_create(sandbox_id="active-sandbox")
 
-        with patch("langchain_kubernetes.provider._build_agent_sandbox_client") as mock_build:
-            sb2 = provider.get_or_create(sandbox_id="active-sandbox")
-            mock_build.assert_not_called()
+        assert sb.id == "active-sandbox"
 
-        assert sb2.id == "active-sandbox"
-
-    def test_raises_not_found_for_unknown_sandbox_id(self):
+    def test_reconnect_failure_falls_through_to_new_sandbox(self):
+        """When reconnect raises SandboxNotFoundError, a new sandbox is provisioned."""
         provider = KubernetesProvider(_agent_sandbox_config())
+        new_client = _make_mock_sandbox_client("new-sandbox")
 
-        with pytest.raises(SandboxNotFoundError, match="unknown-id"):
-            provider.get_or_create(sandbox_id="unknown-id")
+        with patch.object(provider, "reconnect", side_effect=SandboxNotFoundError("gone")):
+            with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=new_client):
+                sb = provider.get_or_create(sandbox_id="stale-id")
+
+        assert sb.id == "new-sandbox"
 
 
 # ---------------------------------------------------------------------------
@@ -122,15 +125,6 @@ class TestGetOrCreateRaw:
         assert isinstance(sandbox, KubernetesSandbox)
         assert sandbox.id == "rawid001"
 
-    def test_raw_backend_tracked(self):
-        provider = KubernetesProvider(_raw_config())
-        mock_backend = _make_mock_backend("rawid002")
-
-        with patch("langchain_kubernetes.provider.KubernetesProvider._create_raw_backend", return_value=mock_backend):
-            provider.get_or_create()
-
-        assert "rawid002" in provider._active_backends
-
 
 # ---------------------------------------------------------------------------
 # list
@@ -143,25 +137,30 @@ class TestList:
         result = provider.list()
         assert result.sandboxes == []
 
-    def test_list_returns_active_sandboxes(self):
+    def test_list_delegates_to_agent_sandbox_listing(self):
+        """list() returns what _list_agent_sandbox returns."""
         provider = KubernetesProvider(_agent_sandbox_config())
-        mock_client = _make_mock_sandbox_client("sb-001")
+        mock_result = SandboxListResponse(sandboxes=[
+            SandboxInfo(id="sb-001", namespace="default", status="running"),
+        ])
 
-        with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=mock_client):
-            provider.get_or_create()
+        with patch.object(provider, "_list_agent_sandbox", return_value=mock_result):
+            result = provider.list()
 
-        result = provider.list()
         assert len(result.sandboxes) == 1
         assert result.sandboxes[0].id == "sb-001"
 
-    def test_list_multiple_sandboxes(self):
+    def test_list_returns_multiple_sandboxes(self):
         provider = KubernetesProvider(_agent_sandbox_config())
-        for i in range(3):
-            client = _make_mock_sandbox_client(f"sb-{i:03d}")
-            with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=client):
-                provider.get_or_create()
+        sandboxes = [
+            SandboxInfo(id=f"sb-{i:03d}", namespace="default", status="running")
+            for i in range(3)
+        ]
+        mock_result = SandboxListResponse(sandboxes=sandboxes)
 
-        result = provider.list()
+        with patch.object(provider, "_list_agent_sandbox", return_value=mock_result):
+            result = provider.list()
+
         assert len(result.sandboxes) == 3
 
 
@@ -171,42 +170,34 @@ class TestList:
 
 
 class TestDelete:
-    def test_delete_calls_backend_cleanup(self):
+    def test_delete_calls_agent_sandbox_delete(self):
+        """delete() calls _delete_agent_sandbox_claim in agent-sandbox mode."""
         provider = KubernetesProvider(_agent_sandbox_config())
-        mock_client = _make_mock_sandbox_client("sb-del")
 
-        with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=mock_client):
-            provider.get_or_create()
-
-        provider.delete(sandbox_id="sb-del")
-
-        # AgentSandboxBackend.cleanup() calls __exit__
-        mock_client.__exit__.assert_called_once_with(None, None, None)
-
-    def test_delete_removes_from_active(self):
-        provider = KubernetesProvider(_agent_sandbox_config())
-        mock_client = _make_mock_sandbox_client("sb-del")
-
-        with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=mock_client):
-            provider.get_or_create()
-
-        assert len(provider.list().sandboxes) == 1
-        provider.delete(sandbox_id="sb-del")
-        assert len(provider.list().sandboxes) == 0
+        with patch.object(provider, "_delete_agent_sandbox_claim") as mock_del:
+            provider.delete(sandbox_id="sb-del")
+            mock_del.assert_called_once_with("sb-del")
 
     def test_delete_nonexistent_is_noop(self):
         provider = KubernetesProvider(_agent_sandbox_config())
         provider.delete(sandbox_id="does-not-exist")  # must not raise
 
-    def test_delete_raw_backend_calls_cleanup(self):
+    def test_delete_raw_calls_pod_delete(self):
+        """delete() calls _delete_raw_pod in raw mode."""
         provider = KubernetesProvider(_raw_config())
-        mock_backend = _make_mock_backend("rawid")
 
-        with patch("langchain_kubernetes.provider.KubernetesProvider._create_raw_backend", return_value=mock_backend):
-            provider.get_or_create()
+        with patch.object(provider, "_delete_raw_pod") as mock_del:
+            provider.delete(sandbox_id="rawid")
+            mock_del.assert_called_once_with("rawid", "default")
 
-        provider.delete(sandbox_id="rawid")
-        mock_backend.cleanup.assert_called_once()
+    def test_delete_raw_triggers_warm_pool_replenish(self):
+        """delete() schedules warm pool replenishment in raw mode when pool is enabled."""
+        provider = KubernetesProvider(_raw_config(warm_pool_size=2))
+
+        with patch.object(provider, "_delete_raw_pod"):
+            with patch.object(provider, "_schedule_replenish") as mock_replenish:
+                provider.delete(sandbox_id="any-pod")
+                mock_replenish.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -279,24 +270,23 @@ class TestAsync:
 
     @pytest.mark.asyncio
     async def test_adelete(self):
+        """adelete() calls _delete_agent_sandbox_claim for agent-sandbox mode."""
         provider = KubernetesProvider(_agent_sandbox_config())
-        mock_client = _make_mock_sandbox_client("async-del")
 
-        with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=mock_client):
-            await provider.aget_or_create()
-
-        await provider.adelete(sandbox_id="async-del")
-        mock_client.__exit__.assert_called_once()
+        with patch.object(provider, "_delete_agent_sandbox_claim") as mock_del:
+            await provider.adelete(sandbox_id="async-del")
+            mock_del.assert_called_once_with("async-del")
 
     @pytest.mark.asyncio
     async def test_alist(self):
         provider = KubernetesProvider(_agent_sandbox_config())
-        mock_client = _make_mock_sandbox_client("async-list-sb")
+        mock_result = SandboxListResponse(sandboxes=[
+            SandboxInfo(id="async-list-sb", namespace="default", status="running"),
+        ])
 
-        with patch("langchain_kubernetes.provider._build_agent_sandbox_client", return_value=mock_client):
-            await provider.aget_or_create()
+        with patch.object(provider, "_list_agent_sandbox", return_value=mock_result):
+            result = await provider.alist()
 
-        result = await provider.alist()
         assert len(result.sandboxes) == 1
         assert result.sandboxes[0].id == "async-list-sb"
 

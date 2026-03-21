@@ -6,7 +6,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from langchain_kubernetes._labels import LABEL_THREAD_ID
 from langchain_kubernetes._types import SandboxInfo, SandboxListResponse
 from langchain_kubernetes.config import KubernetesProviderConfig
 from langchain_kubernetes.provider import KubernetesProvider
@@ -23,15 +22,10 @@ def _raw_config(**kwargs) -> KubernetesProviderConfig:
     return KubernetesProviderConfig(**defaults)
 
 
-def _make_sandbox_info(sid: str, *, status: str = "running", thread_id: str | None = None) -> SandboxInfo:
-    labels = {}
-    if thread_id:
-        labels[LABEL_THREAD_ID] = thread_id
+def _make_sandbox_info(sid: str, *, status: str = "running") -> SandboxInfo:
     return SandboxInfo(
         id=sid,
         namespace="default",
-        thread_id=thread_id,
-        labels=labels,
         status=status,
     )
 
@@ -55,18 +49,6 @@ class TestListWithFilters:
             result = provider.list()
 
         assert len(result.sandboxes) == 2
-
-    def test_list_filters_by_thread_id(self):
-        """list(thread_id=...) filters by that thread."""
-        provider = KubernetesProvider(_raw_config())
-
-        # _list_raw handles the label_selector — just verify thread_id is passed
-        with patch.object(
-            provider, "_list_raw", return_value=SandboxListResponse(sandboxes=[])
-        ) as mock_list:
-            provider.list(thread_id="my-thread")
-            call_kwargs = mock_list.call_args[1]
-            assert call_kwargs["thread_id"] == "my-thread"
 
     def test_list_filters_by_status(self):
         """list(status='running') keeps only running sandboxes."""
