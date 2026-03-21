@@ -1,6 +1,6 @@
 {
   "name": "@bitkaio/langchain-kubernetes",
-  "version": "0.0.1",
+  "version": "0.3.0",
   "description": "Kubernetes sandbox provider for the DeepAgents framework",
   "license": "MIT",
   "author": "bitkaio LLC",
