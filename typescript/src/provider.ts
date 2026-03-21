@@ -4,7 +4,7 @@ import { KubernetesSandbox } from "./sandbox.js";
 import { AgentSandboxBackend } from "./backends/agent-sandbox.js";
 import { RawK8sBackend } from "./backends/raw.js";
 import type { SandboxInfo as AgentSandboxInfo } from "./router-client.js";
-import { SandboxRouterClient } from "./router-client.js";
+import { SandboxRouterClient, isK8sApiConfigured } from "./router-client.js";
 import type { RawSandboxInfo } from "./backends/raw.js";
 import { SandboxNotFoundError } from "./errors.js";
 import {
@@ -394,13 +394,20 @@ export class KubernetesProvider {
     if (mode === "agent-sandbox") {
       const backend = await AgentSandboxBackend.create(this.config, extraLabels, extraAnnotations);
       const sandbox = new KubernetesSandbox(backend);
-      // Patch claim with our labels after creation
-      if (extraLabels && Object.keys(extraLabels).length > 0) {
+      // Patch claim with thread_id labels/annotations after creation.
+      // Best-effort: enables cross-process reconnection. Skipped when K8s API
+      // is not explicitly configured and not running in-cluster — in that case
+      // the in-process manager cache is the deduplication mechanism.
+      if (
+        isK8sApiConfigured(this.config.kubeApiUrl, this.config.kubeToken) &&
+        extraLabels &&
+        Object.keys(extraLabels).length > 0
+      ) {
         const client = buildRouterClient(this.config);
         client.patchSandboxClaim(backend.id, extraLabels, extraAnnotations ?? {}).catch(() => undefined);
       }
-      // Set up idle activity tracking
-      if (ttlIdleSeconds !== undefined) {
+      // Set up idle activity tracking (also K8s API; silently skipped if not configured).
+      if (ttlIdleSeconds !== undefined && isK8sApiConfigured(this.config.kubeApiUrl, this.config.kubeToken)) {
         const claimName = backend.id;
         const client = buildRouterClient(this.config);
         sandbox.setActivityCallback(() => {
@@ -495,6 +502,12 @@ export class KubernetesProvider {
     threadId: string,
     ttlIdleSeconds: number | undefined
   ): Promise<KubernetesSandbox | undefined> {
+    // K8s label lookup requires direct API access. When not configured (no
+    // kubeApiUrl, no kubeToken, not in-cluster) skip silently — the in-process
+    // manager cache is the deduplication mechanism for this common case.
+    if (!isK8sApiConfigured(this.config.kubeApiUrl, this.config.kubeToken)) {
+      return undefined;
+    }
     try {
       const client = buildRouterClient(this.config);
       const items = await client.listSandboxClaims(threadIdSelector(threadId));

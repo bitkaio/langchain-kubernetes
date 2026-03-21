@@ -310,33 +310,249 @@ containers:
 
 ## Usage with DeepAgents
 
-Works the same regardless of mode:
+`KubernetesSandbox` implements `SandboxBackendProtocol`, so it plugs directly into
+[DeepAgents](https://github.com/langchain-ai/deepagents) via the `backend` parameter of
+`create_deep_agent`. When a sandbox backend is set, the agent automatically gains an
+`execute` tool for running shell commands in addition to the standard filesystem tools
+(`ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`).
+
+### One-shot usage
+
+Create one sandbox, run one task, delete it:
 
 ```python
 from langchain_anthropic import ChatAnthropic
-from deepagents import create_agent
+from deepagents import create_deep_agent
 from langchain_kubernetes import KubernetesProvider, KubernetesProviderConfig
 
-# agent-sandbox mode
-provider = KubernetesProvider(
-    KubernetesProviderConfig(template_name="python-sandbox-template")
-)
-
-# or raw mode
-provider = KubernetesProvider(
-    KubernetesProviderConfig(mode="raw", image="python:3.12-slim")
-)
+# Works with either mode — swap the config, nothing else changes
+provider = KubernetesProvider(KubernetesProviderConfig(
+    template_name="python-sandbox-template",   # agent-sandbox mode
+    # mode="raw", image="python:3.12-slim",    # raw mode alternative
+))
 
 sandbox = provider.get_or_create()
-llm = ChatAnthropic(model="claude-opus-4-5")
-agent = create_agent(llm, backend=sandbox)
+llm = ChatAnthropic(model="claude-opus-4-6")
+agent = create_deep_agent(model=llm, backend=sandbox)
 
 result = agent.invoke({
     "messages": [("user", "Write and run a Python script that prints the Fibonacci sequence")]
 })
-print(result)
+print(result["messages"][-1].content)
 
 provider.delete(sandbox_id=sandbox.id)
+```
+
+### Per-thread sandbox management (multi-user / multi-turn)
+
+For chat applications each conversation needs its own persistent sandbox — one that
+survives across turns so that installed packages, written files, and shell state are
+retained between messages. `get_or_create(thread_id=...)` is idempotent: it returns
+the existing sandbox for a thread if one is running, and creates one only on the first
+call. No try/except, no manual label bookkeeping.
+
+```python
+from langchain_anthropic import ChatAnthropic
+from deepagents import create_deep_agent
+from langchain_kubernetes import KubernetesProvider, KubernetesProviderConfig
+
+provider = KubernetesProvider(KubernetesProviderConfig(
+    template_name="python-sandbox-template",
+    ttl_idle_seconds=1800,   # auto-delete sandbox after 30 min of inactivity
+))
+llm = ChatAnthropic(model="claude-opus-4-6")
+
+def handle_message(thread_id: str, user_message: str) -> str:
+    # Idempotent: reconnects to existing sandbox, creates only on first call.
+    sandbox = provider.get_or_create(thread_id=thread_id, ttl_seconds=86400)
+    agent = create_deep_agent(model=llm, backend=sandbox)
+    result = agent.invoke(
+        {"messages": [("user", user_message)]},
+        config={"configurable": {"thread_id": thread_id}},  # LangGraph checkpoint key
+    )
+    return result["messages"][-1].content
+
+# Both calls run in the same sandbox — files and packages persist between turns
+print(handle_message("user-42-session-7", "Install numpy and create a random 3×3 matrix"))
+print(handle_message("user-42-session-7", "Print the matrix you just created"))
+```
+
+### `KubernetesSandboxManager` — fully automatic thread wiring
+
+`KubernetesSandboxManager` owns the entire sandbox lifecycle and exposes a
+`backend_factory` callable that `create_deep_agent` accepts as its `backend` argument.
+The factory extracts `thread_id` from the LangGraph `RunnableConfig` automatically —
+**no manual `get_or_create` calls needed**:
+
+```python
+from langchain_anthropic import ChatAnthropic
+from deepagents import create_deep_agent
+from langchain_kubernetes import KubernetesSandboxManager, KubernetesProviderConfig
+
+manager = KubernetesSandboxManager(
+    KubernetesProviderConfig(
+        template_name="python-sandbox-template",
+        warm_pool_name="python-pool",        # claim from a pre-warmed pool
+    ),
+    ttl_seconds=86400,       # absolute TTL from creation (24 h)
+    ttl_idle_seconds=1800,   # idle TTL from last execute() (30 min)
+    default_labels={"app": "my-chat-service"},
+)
+llm = ChatAnthropic(model="claude-opus-4-6")
+
+# backend_factory is Callable[[ToolRuntime], SandboxBackendProtocol]
+agent = create_deep_agent(model=llm, backend=manager.backend_factory)
+
+result = agent.invoke(
+    {"messages": [("user", "Set up a data pipeline that downloads the iris dataset")]},
+    config={"configurable": {"thread_id": "session-abc-123"}},
+)
+
+# Second turn — same thread_id → same sandbox, files from turn 1 still there
+result2 = agent.invoke(
+    {"messages": [("user", "Plot a histogram of petal length and save it as plot.png")]},
+    config={"configurable": {"thread_id": "session-abc-123"}},
+)
+
+manager.shutdown()
+```
+
+#### Async / FastAPI
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from langchain_anthropic import ChatAnthropic
+from deepagents import create_deep_agent
+from langchain_kubernetes import KubernetesSandboxManager, KubernetesProviderConfig
+
+manager: KubernetesSandboxManager | None = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global manager
+    manager = KubernetesSandboxManager(
+        KubernetesProviderConfig(template_name="python-sandbox-template"),
+        ttl_idle_seconds=1800,
+    )
+    yield
+    await manager.ashutdown()
+
+app = FastAPI(lifespan=lifespan)
+llm = ChatAnthropic(model="claude-opus-4-6")
+
+@app.post("/chat/{thread_id}")
+async def chat(thread_id: str, message: str):
+    agent = create_deep_agent(model=llm, backend=manager.backend_factory)
+    result = await agent.ainvoke(
+        {"messages": [("user", message)]},
+        config={"configurable": {"thread_id": thread_id}},
+    )
+    return {"reply": result["messages"][-1].content}
+```
+
+### Hosting with `langgraph dev` / LangGraph Platform
+
+When you run DeepAgents via the LangGraph CLI (`langgraph dev`) or deploy to LangGraph
+Platform, the **server** calls `.invoke()` on your graph — you never do it yourself.
+The server creates threads (each with a unique `thread_id`), injects the `thread_id`
+into `config["configurable"]["thread_id"]` for every run, and calls your graph.
+
+`manager.backend_factory` is already designed for this: it is called on every turn by
+DeepAgents with the current `RunnableConfig` (which the server has already populated),
+so no extra wiring is needed.
+
+**`agent.py`** — define at module level, export the compiled graph:
+
+```python
+from langchain_anthropic import ChatAnthropic
+from deepagents import create_deep_agent
+from langchain_kubernetes import KubernetesSandboxManager, KubernetesProviderConfig
+
+# Module-level singletons — created once when the server imports this file.
+manager = KubernetesSandboxManager(
+    KubernetesProviderConfig(
+        template_name="python-sandbox-template",
+        warm_pool_name="python-pool",
+    ),
+    ttl_idle_seconds=1800,
+    default_labels={"app": "my-langgraph-agent"},
+)
+llm = ChatAnthropic(model="claude-opus-4-6")
+
+# The server points langgraph.json at this variable.
+# backend_factory extracts thread_id from whatever config the server passes.
+graph = create_deep_agent(model=llm, backend=manager.backend_factory)
+```
+
+**`langgraph.json`:**
+
+```json
+{
+    "dependencies": ["."],
+    "graphs": {
+        "agent": "./agent.py:graph"
+    }
+}
+```
+
+```bash
+pip install "langgraph-cli[inmem]"
+langgraph dev
+# → http://localhost:2024
+# → LangGraph Studio: https://smith.langchain.com/studio/?baseUrl=http://localhost:2024
+```
+
+Interact via the LangGraph SDK — the server handles thread lifecycle and injects
+`thread_id` automatically:
+
+```python
+from langgraph_sdk import get_client
+
+client = get_client(url="http://localhost:2024")
+
+# Create a thread — maps 1:1 to a KubernetesSandbox created on the first run
+thread = await client.threads.create()
+
+# First run: manager creates the sandbox and labels it with thread_id
+run = await client.runs.create(
+    thread_id=thread["thread_id"],
+    assistant_id="agent",
+    input={"messages": [{"role": "user", "content": "Install pandas and analyse the iris dataset"}]},
+)
+
+# Second run: manager finds the existing sandbox by label selector — same filesystem state
+run2 = await client.runs.create(
+    thread_id=thread["thread_id"],
+    assistant_id="agent",
+    input={"messages": [{"role": "user", "content": "Now plot a histogram of petal length"}]},
+)
+```
+
+### How thread_id flows through the stack
+
+```text
+── Direct .invoke() ──────────────────────────────────────────────────────────
+agent.invoke(input, config={"configurable": {"thread_id": "abc"}})
+  │
+  └─▶ DeepAgents calls backend_factory(tool_runtime)          ─┐
+                                                                │
+── langgraph dev / LangGraph Platform ──────────────────────── │ same path
+POST /runs  { thread_id: "abc", input: {...} }                  │
+  │                                                             │
+  └─▶ Server injects thread_id into RunnableConfig             │
+        └─▶ server calls graph(input, config)                   │
+              └─▶ DeepAgents calls backend_factory(tool_runtime)─┘
+                    │
+                    └─▶ KubernetesSandboxManager extracts thread_id
+                          │
+                          └─▶ provider.get_or_create(thread_id="abc", ...)
+                                │
+                                ├─ (first run)   creates Pod/SandboxClaim
+                                │                labels it thread-id=abc
+                                │
+                                └─ (later runs)  finds by label selector
+                                                 reconnects → same sandbox
 ```
 
 ---
@@ -471,7 +687,7 @@ The following fields were added to `KubernetesProviderConfig` (both modes unless
 | `ttl_idle_seconds` | `int \| None` | `None` | Default idle TTL passed to `get_or_create()` |
 | `warm_pool_size` | `int` | `0` | Number of warm Pods to pre-create (raw mode only) |
 | `warm_pool_name` | `str \| None` | `None` | `SandboxWarmPool` resource to claim from (agent-sandbox only) |
-| `kube_api_url` | `str \| None` | `None` | K8s API URL for SandboxClaim management (agent-sandbox, defaults to in-cluster) |
+| `kube_api_url` | `str \| None` | `None` | K8s API URL for thread_id label writes and cross-process reconnection (agent-sandbox). Auto-detected when running in-cluster. **Not required** when using `KubernetesSandboxManager` for single-process deduplication. |
 | `kube_token` | `str \| None` | `None` | Bearer token for K8s API (agent-sandbox; auto-reads in-cluster token if unset) |
 
 ### Warm pool configuration
@@ -574,6 +790,62 @@ asyncio.run(main())
 ---
 
 ## Troubleshooting
+
+### Phantom sandboxes — multiple sandboxes created per thread (agent-sandbox mode)
+
+**Symptom:** Multiple `SandboxClaim` resources are created for the same `thread_id`.
+You may see `Creating SandboxClaim ...` logged several times for the same thread in rapid
+succession, and warnings like:
+
+```text
+thread_id lookup (agent-sandbox) failed: <urlopen error [Errno 8] nodename nor servname provided>
+```
+
+**Why this happens:** Two separate issues can combine:
+
+1. **Concurrent workers racing** — the LangGraph Platform server dispatches model and tool
+   nodes across multiple async workers, all calling `backend_factory` for the same thread
+   at the same time. Before this was fixed, each worker independently missed the in-process
+   cache and created its own sandbox.
+
+2. **K8s label lookup fails silently** — the thread_id label lookup and annotation patches
+   go through the Kubernetes API directly (not the sandbox-router). When `kube_api_url` is
+   not configured and the code isn't running in-cluster, these calls fail. Previously this
+   caused a WARNING flood; now they are skipped silently.
+
+**Default behaviour (no `kube_api_url` set, not in-cluster):**
+
+The in-process cache inside `KubernetesSandboxManager` is the deduplication mechanism.
+A per-thread-id lock serialises concurrent provisioning: only the first worker calls
+`provider.get_or_create`; the rest wait and reuse the sandbox the first one created.
+No K8s API access is needed for this — it works with the sandbox-router alone.
+
+You will see **no warnings** in the logs for skipped label/lookup operations. Thread_id
+labels and last-activity annotations are simply not written to the cluster, which means
+cross-process reconnection (e.g., after a server restart) is not available.
+
+**To enable cross-process reconnection (optional):**
+
+When `kube_api_url` is set and reachable, thread_id labels are written to each
+`SandboxClaim`. On restart, `get_or_create(thread_id=...)` can find the existing claim
+and reconnect instead of creating a new sandbox.
+
+```bash
+kubectl proxy --port=8001   # or expose the K8s API through a proper ingress
+```
+
+```python
+manager = KubernetesSandboxManager(
+    KubernetesProviderConfig(
+        template_name="python-sandbox-template",
+        kube_api_url="http://localhost:8001",  # enables cross-process reconnection
+    ),
+    ttl_idle_seconds=1800,
+)
+```
+
+If you set `kube_api_url` and still see warnings, the proxy is not reachable — check
+`curl http://localhost:8001/api/v1/namespaces` to confirm.
 
 ### `ImportError: ... requires the 'k8s-agent-sandbox' package`
 

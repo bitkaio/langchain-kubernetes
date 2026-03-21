@@ -58,6 +58,28 @@ def _make_headers(token: str | None, content_type: str = "application/json") -> 
     return headers
 
 
+def is_k8s_api_configured(api_url: str | None, token_override: str | None) -> bool:
+    """Return True if direct Kubernetes API access has been explicitly configured
+    or the process is running inside a cluster.
+
+    When neither is true (e.g. a developer running the agent-sandbox provider
+    on a local machine against an externally-hosted sandbox-router) there is no
+    reason to attempt K8s API calls, and failures should not produce warnings.
+
+    Args:
+        api_url: Explicit Kubernetes API base URL from config (``kube_api_url``).
+        token_override: Explicit bearer token from config (``kube_token``).
+
+    Returns:
+        ``True`` if K8s API access is configured or expected to work.
+    """
+    if api_url or token_override:
+        return True
+    # Detect in-cluster by the presence of the service account token that
+    # Kubernetes mounts automatically in every Pod.
+    return Path(_IN_CLUSTER_TOKEN_PATH).exists()
+
+
 def k8s_get(
     api_url: str | None,
     token_override: str | None,

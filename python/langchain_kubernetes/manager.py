@@ -76,7 +76,12 @@ class KubernetesSandboxManager:
         self._default_labels = default_labels
         # thread_id -> KubernetesSandbox
         self._cache: dict[str, KubernetesSandbox] = {}
+        # Guards mutations to _cache and _thread_locks
         self._lock = threading.Lock()
+        # Per-thread-id locks serialise concurrent provisioning for the same thread.
+        # Without these, N concurrent callers that all miss the cache simultaneously
+        # would each call get_or_create and produce N orphaned sandboxes.
+        self._thread_locks: dict[str, threading.Lock] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -107,6 +112,9 @@ class KubernetesSandboxManager:
     async def abackend_factory(self, config: Any) -> KubernetesSandbox:
         """Async variant of :attr:`backend_factory`.
 
+        Runs the blocking ``get_or_create`` call in the default thread-pool
+        executor so the event loop is never blocked.
+
         Args:
             config: LangGraph ``RunnableConfig`` dict.
 
@@ -114,7 +122,7 @@ class KubernetesSandboxManager:
             :class:`~langchain_kubernetes.sandbox.KubernetesSandbox` for the thread.
         """
         thread_id = _extract_thread_id(config)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._get_or_create_cached, thread_id)
 
     def get_sandbox(self, thread_id: str) -> KubernetesSandbox | None:
@@ -139,6 +147,7 @@ class KubernetesSandboxManager:
         with self._lock:
             sandboxes = list(self._cache.items())
             self._cache.clear()
+            self._thread_locks.clear()
 
         for thread_id, sandbox in sandboxes:
             try:
@@ -174,21 +183,67 @@ class KubernetesSandboxManager:
     # ------------------------------------------------------------------
 
     def _get_or_create_cached(self, thread_id: str) -> KubernetesSandbox:
-        """Get from cache or call provider.get_or_create with TTL settings."""
+        """Get from cache or call provider.get_or_create with TTL settings.
+
+        Cache hits are returned immediately with no I/O, safe from any context.
+
+        Cache misses acquire a per-thread-id lock before provisioning.  This
+        serialises concurrent callers for the *same* ``thread_id`` so that
+        only the first caller provisions a sandbox; the rest find it in the
+        cache when they re-check inside the per-thread lock.  Without this,
+        N concurrent async workers (as used by the LangGraph Platform server)
+        would each race to call ``get_or_create`` and create N orphaned
+        sandboxes for the same thread.
+
+        Cache misses also refuse to run if called from inside a running asyncio
+        event loop — use :meth:`abackend_factory` in async contexts instead,
+        which wraps this call in ``loop.run_in_executor``.
+        """
+        # ── Fast path: cache hit, no I/O ─────────────────────────────────────
         with self._lock:
             if thread_id in self._cache:
                 return self._cache[thread_id]
 
-        sandbox = self._provider.get_or_create(
-            thread_id=thread_id,
-            labels=self._default_labels,
-            ttl_seconds=self._ttl_seconds,
-            ttl_idle_seconds=self._ttl_idle_seconds,
-        )
+        # ── Cache miss: refuse to block the event loop ────────────────────────
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass  # no running loop — safe to proceed synchronously
+        else:
+            raise RuntimeError(
+                "KubernetesSandboxManager.backend_factory was called with a cache miss "
+                "from inside a running asyncio event loop. Blocking socket I/O on the "
+                "event loop degrades ASGI servers and is caught by blockbuster in dev mode.\n\n"
+                "Use one of these alternatives:\n"
+                "  1. await manager.abackend_factory(config)  — wraps blocking I/O in a thread\n"
+                "  2. await asyncio.to_thread(manager._get_or_create_cached, thread_id)  — pre-warm\n"
+                "  3. Call manager._get_or_create_cached(thread_id) synchronously before "
+                "starting the event loop (e.g. in lifespan startup)."
+            )
 
+        # ── Acquire per-thread lock to serialise concurrent provisioning ──────
+        # Multiple workers may reach here simultaneously for the same thread_id.
+        # Only one should call get_or_create; the rest must wait and then reuse
+        # the sandbox the winner stored in the cache.
         with self._lock:
-            # Check again in case another thread just created it
-            if thread_id not in self._cache:
+            if thread_id not in self._thread_locks:
+                self._thread_locks[thread_id] = threading.Lock()
+            thread_lock = self._thread_locks[thread_id]
+
+        with thread_lock:
+            # Re-check: a concurrent caller may have provisioned while we waited
+            with self._lock:
+                if thread_id in self._cache:
+                    return self._cache[thread_id]
+
+            sandbox = self._provider.get_or_create(
+                thread_id=thread_id,
+                labels=self._default_labels,
+                ttl_seconds=self._ttl_seconds,
+                ttl_idle_seconds=self._ttl_idle_seconds,
+            )
+
+            with self._lock:
                 self._cache[thread_id] = sandbox
 
         return self._cache[thread_id]

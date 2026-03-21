@@ -55,6 +55,12 @@ export class KubernetesSandboxManager {
   private readonly defaultLabels?: Record<string, string>;
   /** thread_id → KubernetesSandbox */
   private readonly _cache = new Map<string, KubernetesSandbox>();
+  /**
+   * In-flight provisions keyed by thread_id. Concurrent callers for the same
+   * thread_id all await the same Promise instead of each starting their own
+   * getOrCreate — preventing N orphaned sandboxes for a single thread.
+   */
+  private readonly _pending = new Map<string, Promise<KubernetesSandbox>>();
 
   constructor(
     config: Partial<KubernetesProviderConfig>,
@@ -97,18 +103,36 @@ export class KubernetesSandboxManager {
   async abackendFactory(config: unknown): Promise<KubernetesSandbox> {
     const threadId = extractThreadId(config);
 
+    // Fast path: already provisioned.
     const cached = this._cache.get(threadId);
     if (cached) return cached;
 
-    const sandbox = await this._provider.getOrCreate({
-      threadId,
-      ttlSeconds: this.ttlSeconds,
-      ttlIdleSeconds: this.ttlIdleSeconds,
-      labels: this.defaultLabels,
-    });
+    // Serialise concurrent provisioning for the same thread_id.
+    // If another caller is already provisioning this thread, await its result
+    // rather than starting a second getOrCreate — which would create a second
+    // orphaned sandbox (the same race seen with the Python LangGraph server).
+    const pending = this._pending.get(threadId);
+    if (pending) return pending;
 
-    this._cache.set(threadId, sandbox);
-    return sandbox;
+    const provision = this._provider
+      .getOrCreate({
+        threadId,
+        ttlSeconds: this.ttlSeconds,
+        ttlIdleSeconds: this.ttlIdleSeconds,
+        labels: this.defaultLabels,
+      })
+      .then((sandbox) => {
+        this._cache.set(threadId, sandbox);
+        this._pending.delete(threadId);
+        return sandbox;
+      })
+      .catch((err: unknown) => {
+        this._pending.delete(threadId);
+        throw err;
+      });
+
+    this._pending.set(threadId, provision);
+    return provision;
   }
 
   // ── Lookup ─────────────────────────────────────────────────────────────────
@@ -132,6 +156,7 @@ export class KubernetesSandboxManager {
   async shutdown(): Promise<void> {
     const entries = Array.from(this._cache.entries());
     this._cache.clear();
+    this._pending.clear();
 
     for (const [, sandbox] of entries) {
       try {

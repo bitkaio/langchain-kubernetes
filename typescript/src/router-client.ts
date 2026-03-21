@@ -20,6 +20,23 @@ const SANDBOX_PLURAL = "sandboxes";
 const IN_CLUSTER_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 const IN_CLUSTER_API_URL = "https://kubernetes.default.svc.cluster.local";
 
+/**
+ * Return `true` if direct Kubernetes API access has been explicitly configured
+ * or the process is running inside a cluster.
+ *
+ * Used to gate label-write and thread_id-lookup operations that require the K8s
+ * API. In agent-sandbox mode the sandbox-router is the designed external API;
+ * direct K8s API access is an optional enhancement for cross-process reconnection.
+ *
+ * @param kubeApiUrl - Explicit K8s API base URL from config (`kubeApiUrl`).
+ * @param kubeToken  - Explicit bearer token from config (`kubeToken`).
+ */
+export function isK8sApiConfigured(kubeApiUrl?: string, kubeToken?: string): boolean {
+  if (kubeApiUrl || kubeToken) return true;
+  // KUBERNETES_SERVICE_HOST is injected by Kubernetes into every Pod's environment.
+  return !!process.env["KUBERNETES_SERVICE_HOST"];
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /** Result returned by the sandbox execute endpoint. */

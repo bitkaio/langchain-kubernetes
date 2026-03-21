@@ -709,7 +709,22 @@ class KubernetesProvider(SandboxProvider):
         thread_id: str,
         ttl_idle_seconds: int | None,
     ) -> KubernetesSandbox | None:
-        """Look up a SandboxClaim by thread-id label."""
+        """Look up a SandboxClaim by thread-id label.
+
+        Requires direct K8s API access (configured via ``kube_api_url`` or
+        in-cluster service account).  When neither is available the lookup is
+        skipped silently — deduplication falls back to the in-process cache
+        managed by :class:`~langchain_kubernetes.manager.KubernetesSandboxManager`.
+        """
+        from langchain_kubernetes._k8s_http import is_k8s_api_configured
+
+        if not is_k8s_api_configured(self._config.kube_api_url, self._config.kube_token):
+            logger.debug(
+                "thread_id lookup (agent-sandbox) skipped: no K8s API configured "
+                "and not running in-cluster. Set kube_api_url for cross-process reconnection."
+            )
+            return None
+
         selector = thread_id_selector(thread_id)
         try:
             items = self._list_sandbox_claims(label_selector=selector)
@@ -872,8 +887,22 @@ class KubernetesProvider(SandboxProvider):
         labels: dict[str, str],
         annotations: dict[str, str],
     ) -> None:
-        """Patch a SandboxClaim with labels and annotations."""
-        from langchain_kubernetes._k8s_http import k8s_patch
+        """Patch a SandboxClaim with labels and annotations.
+
+        Best-effort: enables cross-process reconnection via ``find_by_thread_id``.
+        Silently skipped when K8s API access is not configured (no ``kube_api_url``
+        and not in-cluster). A warning is only emitted when K8s API IS configured
+        but the request fails, since that indicates a fixable misconfiguration.
+        """
+        from langchain_kubernetes._k8s_http import is_k8s_api_configured, k8s_patch
+
+        if not is_k8s_api_configured(self._config.kube_api_url, self._config.kube_token):
+            logger.debug(
+                "Skipping label patch for SandboxClaim %s: no K8s API configured "
+                "and not in-cluster. Thread_id labels require kube_api_url.",
+                claim_name,
+            )
+            return
 
         path = (
             f"/apis/{_CLAIM_API_GROUP}/{_CLAIM_API_VERSION}"
@@ -898,8 +927,15 @@ class KubernetesProvider(SandboxProvider):
             )
 
     def _patch_claim_last_activity(self, claim_name: str) -> None:
-        """Update the last-activity annotation on a SandboxClaim."""
-        from langchain_kubernetes._k8s_http import k8s_patch
+        """Update the last-activity annotation on a SandboxClaim.
+
+        Best-effort fire-and-forget. Silently skipped when K8s API access is not
+        configured (no ``kube_api_url`` and not in-cluster).
+        """
+        from langchain_kubernetes._k8s_http import is_k8s_api_configured, k8s_patch
+
+        if not is_k8s_api_configured(self._config.kube_api_url, self._config.kube_token):
+            return
 
         path = (
             f"/apis/{_CLAIM_API_GROUP}/{_CLAIM_API_VERSION}"
@@ -1096,6 +1132,13 @@ def _raise_clear_agent_sandbox_error(
 ) -> None:
     """Re-raise *exc* with a human-readable message for common failure modes."""
     msg = str(exc).lower()
+
+    # Guard: re-raise dev-server enforcement errors (e.g. blockbuster.BlockingError,
+    # which says "Blocking call to socket.socket.connect") without wrapping them.
+    # These errors contain keywords like "connect" that would otherwise trigger the
+    # connectivity hint below, completely hiding the real cause from the developer.
+    if "blocking call" in msg:
+        raise exc
 
     if "timeout" in msg or isinstance(exc, TimeoutError):
         raise TimeoutError(

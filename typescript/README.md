@@ -123,6 +123,243 @@ const downloads = await sandbox.downloadFiles(["/workspace/output.txt"]);
 // sandbox.ls(), sandbox.read(), sandbox.write(), sandbox.glob(), ...
 ```
 
+## Usage with DeepAgents
+
+`KubernetesSandbox` implements `SandboxBackendProtocol`, so it plugs directly into
+[DeepAgents](https://github.com/langchain-ai/deepagents) via the `backend` parameter of
+`createDeepAgent`. When a sandbox backend is set, the agent automatically gains an
+`execute` tool for running shell commands in addition to the standard filesystem tools.
+
+### One-shot usage
+
+```typescript
+import { ChatAnthropic } from "@langchain/anthropic";
+import { createDeepAgent } from "deepagents";
+import { KubernetesProvider } from "@bitkaio/langchain-kubernetes";
+
+// Works with either mode — swap the config, nothing else changes
+const provider = new KubernetesProvider({
+  routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
+  templateName: "python-sandbox-template",   // agent-sandbox mode
+  // mode: "raw", image: "python:3.12-slim", // raw mode alternative
+});
+
+const sandbox = await provider.getOrCreate();
+const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
+const agent = createDeepAgent({ model: llm, backend: sandbox });
+
+const result = await agent.invoke({
+  messages: [{ role: "user", content: "Write and run a Python script that prints the Fibonacci sequence" }],
+});
+console.log(result.messages.at(-1)?.content);
+
+await provider.delete(sandbox.id);
+```
+
+### Per-thread sandbox management (multi-user / multi-turn)
+
+`getOrCreate({ threadId })` is idempotent: it returns the existing sandbox for a thread
+if one is running, and creates one only on the first call. Installed packages, written
+files, and shell state persist between turns on the same thread.
+
+```typescript
+import { ChatAnthropic } from "@langchain/anthropic";
+import { createDeepAgent } from "deepagents";
+import { KubernetesProvider } from "@bitkaio/langchain-kubernetes";
+
+const provider = new KubernetesProvider({
+  routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
+  templateName: "python-sandbox-template",
+  ttlIdleSeconds: 1800,   // auto-delete sandbox after 30 min of inactivity
+});
+const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
+
+async function handleMessage(threadId: string, userMessage: string): Promise<string> {
+  // Idempotent: reconnects to existing sandbox, creates only on first call
+  const sandbox = await provider.getOrCreate({ threadId, ttlSeconds: 86400 });
+  const agent = createDeepAgent({ model: llm, backend: sandbox });
+
+  const result = await agent.invoke(
+    { messages: [{ role: "user", content: userMessage }] },
+    { configurable: { thread_id: threadId } },  // LangGraph checkpoint key
+  );
+  return result.messages.at(-1)?.content ?? "";
+}
+
+// Both calls run in the same sandbox — state persists between turns
+await handleMessage("user-42-session-7", "Install numpy and create a random 3×3 matrix");
+await handleMessage("user-42-session-7", "Print the matrix you just created");
+```
+
+### `KubernetesSandboxManager` — fully automatic thread wiring
+
+`KubernetesSandboxManager` owns the entire sandbox lifecycle and exposes a
+`backendFactory` callable that `createDeepAgent` accepts as its `backend` argument.
+The factory extracts `threadId` from the LangGraph `RunnableConfig` automatically:
+
+```typescript
+import { ChatAnthropic } from "@langchain/anthropic";
+import { createDeepAgent } from "deepagents";
+import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
+
+const manager = new KubernetesSandboxManager(
+  {
+    routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
+    templateName: "python-sandbox-template",
+    warmPoolName: "python-pool",     // claim from a pre-warmed pool
+  },
+  {
+    ttlSeconds: 86400,       // absolute TTL from creation (24 h)
+    ttlIdleSeconds: 1800,    // idle TTL from last execute() (30 min)
+    defaultLabels: { app: "my-chat-service" },
+  },
+);
+
+const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
+
+// backendFactory is (config: RunnableConfig) => Promise<KubernetesSandbox>
+const agent = createDeepAgent({ model: llm, backend: manager.backendFactory });
+
+const result = await agent.invoke(
+  { messages: [{ role: "user", content: "Set up a data pipeline for the iris dataset" }] },
+  { configurable: { thread_id: "session-abc-123" } },
+);
+
+// Second turn — same thread_id → same sandbox, files from turn 1 still there
+const result2 = await agent.invoke(
+  { messages: [{ role: "user", content: "Plot a histogram of petal length" }] },
+  { configurable: { thread_id: "session-abc-123" } },
+);
+
+await manager.asyncShutdown();
+```
+
+#### Express / Hono usage
+
+```typescript
+import express from "express";
+import { ChatAnthropic } from "@langchain/anthropic";
+import { createDeepAgent } from "deepagents";
+import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
+
+const manager = new KubernetesSandboxManager(
+  { routerUrl: "http://sandbox-router-svc:8080", templateName: "python-sandbox-template" },
+  { ttlIdleSeconds: 1800 },
+);
+const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
+const agent = createDeepAgent({ model: llm, backend: manager.backendFactory });
+
+const app = express();
+app.use(express.json());
+
+app.post("/chat/:threadId", async (req, res) => {
+  const result = await agent.invoke(
+    { messages: [{ role: "user", content: req.body.message }] },
+    { configurable: { thread_id: req.params.threadId } },
+  );
+  res.json({ reply: result.messages.at(-1)?.content });
+});
+
+process.on("SIGTERM", () => manager.asyncShutdown());
+app.listen(3000);
+```
+
+### Hosting with `langgraph dev` / LangGraph Platform
+
+When you run DeepAgents via the LangGraph CLI (`langgraph dev`) or deploy to LangGraph
+Platform, the **server** calls the graph for you — you never write `.invoke()` yourself.
+The server creates threads (each with a unique `thread_id`), injects it into
+`config.configurable.thread_id` for every run, and calls your graph.
+
+`manager.backendFactory` is already designed for this: it receives the `RunnableConfig`
+that the server has already populated, extracts `thread_id`, and routes to the right
+sandbox.
+
+**`agent.ts`** — module-level singletons, export the compiled graph:
+
+```typescript
+import { ChatAnthropic } from "@langchain/anthropic";
+import { createDeepAgent } from "deepagents";
+import { KubernetesSandboxManager } from "@bitkaio/langchain-kubernetes";
+
+// Created once when the server imports this module — not per-request
+export const manager = new KubernetesSandboxManager(
+  {
+    routerUrl: "http://sandbox-router-svc.default.svc.cluster.local:8080",
+    templateName: "python-sandbox-template",
+    warmPoolName: "python-pool",
+  },
+  { ttlIdleSeconds: 1800, defaultLabels: { app: "my-langgraph-agent" } },
+);
+
+const llm = new ChatAnthropic({ model: "claude-opus-4-6" });
+
+// The server points langgraph.json at this export
+export const graph = createDeepAgent({ model: llm, backend: manager.backendFactory });
+```
+
+**`langgraph.json`:**
+
+```json
+{
+    "graphs": {
+        "agent": "./agent.ts:graph"
+    }
+}
+```
+
+```bash
+npx @langchain/langgraph-cli dev
+# → http://localhost:2024
+```
+
+Interact via the LangGraph SDK — the server injects `thread_id` automatically:
+
+```typescript
+import { Client } from "@langchain/langgraph-sdk";
+
+const client = new Client({ apiUrl: "http://localhost:2024" });
+
+// Create a thread — maps 1:1 to a KubernetesSandbox on the first run
+const thread = await client.threads.create();
+
+// First run: manager creates sandbox, labels it with thread_id
+await client.runs.create(thread.thread_id, "agent", {
+  input: { messages: [{ role: "user", content: "Install pandas and analyse the iris dataset" }] },
+});
+
+// Second run: manager finds existing sandbox by label selector — same filesystem state
+await client.runs.create(thread.thread_id, "agent", {
+  input: { messages: [{ role: "user", content: "Now plot a histogram of petal length" }] },
+});
+```
+
+### How thread_id flows through the stack
+
+```text
+── Direct .invoke() ──────────────────────────────────────────────────────────
+agent.invoke(input, { configurable: { thread_id: "abc" } })
+  │
+  └─▶ DeepAgents calls backendFactory(toolRuntime)            ─┐
+                                                                │
+── langgraph dev / LangGraph Platform ──────────────────────── │ same path
+POST /runs  { thread_id: "abc", input: {...} }                  │
+  │                                                             │
+  └─▶ Server injects thread_id into RunnableConfig             │
+        └─▶ server calls graph(input, config)                   │
+              └─▶ DeepAgents calls backendFactory(toolRuntime) ─┘
+                    │
+                    └─▶ KubernetesSandboxManager extracts threadId
+                          │
+                          └─▶ provider.getOrCreate({ threadId: "abc", ... })
+                                │
+                                ├─ (first run)   creates Pod/SandboxClaim
+                                │                labels it thread-id=abc
+                                │
+                                └─ (later runs)  finds by label selector
+                                                 reconnects → same sandbox
+```
+
 ## Per-thread sandboxes and lifecycle management
 
 ### KubernetesSandboxManager (LangGraph integration)
