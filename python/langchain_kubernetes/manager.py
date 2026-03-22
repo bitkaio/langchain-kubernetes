@@ -94,10 +94,81 @@ class KubernetesSandboxManager:
         self._ttl_seconds = ttl_seconds
         self._ttl_idle_seconds = ttl_idle_seconds
         self._default_labels = default_labels
+        self._sandbox_by_thread: dict[str, KubernetesSandbox] = {}
 
     # ------------------------------------------------------------------
     # Primary integration point: LangGraph node factory
     # ------------------------------------------------------------------
+
+    def _make_backend_factory(self) -> Callable:
+        """Return a sync backend factory that reads the cached sandbox for the current thread.
+
+        Safe to call from deepagents' synchronous middleware — does a plain dict
+        lookup, no I/O. The sandbox must have been placed in the cache by the
+        setup node before the deepagent subgraph runs.
+        """
+        manager = self
+
+        def factory(runtime: Any) -> "KubernetesSandbox":
+            from langchain_core.runnables.config import ensure_config
+
+            config = ensure_config()
+            thread_id: str | None = (config.get("configurable") or {}).get("thread_id")
+            if thread_id is None:
+                raise RuntimeError(
+                    "KubernetesSandboxManager: no thread_id in LangGraph config. "
+                    "Invoke with config={'configurable': {'thread_id': '...'}}."
+                )
+            sandbox = manager._sandbox_by_thread.get(thread_id)
+            if sandbox is None:
+                raise RuntimeError(
+                    f"KubernetesSandboxManager: no sandbox cached for thread "
+                    f"{thread_id!r}. Ensure the setup node runs before the agent."
+                )
+            return sandbox
+
+        return factory
+
+    def create_setup_node(
+        self,
+        *,
+        state_sandbox_key: str = DEFAULT_SANDBOX_STATE_KEY,
+    ) -> Callable:
+        """Return an async LangGraph node that acquires the sandbox and caches it.
+
+        Reads ``state[state_sandbox_key]`` to reconnect an existing sandbox (or
+        provision a new one), stores it in ``_sandbox_by_thread[thread_id]``, and
+        writes the (possibly new) ``sandbox_id`` back to state.
+
+        Must be wired to run before the deepagent subgraph node.
+
+        Args:
+            state_sandbox_key: State field that holds the sandbox ID.
+
+        Returns:
+            An ``async def setup_node(state, config)`` function.
+        """
+        manager = self
+
+        async def setup_node(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
+            from langchain_core.runnables.config import ensure_config
+
+            cfg = config or ensure_config()
+            thread_id: str | None = (cfg.get("configurable") or {}).get("thread_id")
+            if thread_id is None:
+                raise RuntimeError(
+                    "KubernetesSandboxManager setup_node: no thread_id in config."
+                )
+            sandbox_id: str | None = state.get(state_sandbox_key)
+            sandbox = await manager._aget_or_reconnect(sandbox_id)
+            manager._sandbox_by_thread[thread_id] = sandbox
+            updates: dict[str, Any] = {}
+            if sandbox.id != sandbox_id:
+                updates[state_sandbox_key] = sandbox.id
+            return updates
+
+        setup_node.__name__ = "setup_node"
+        return setup_node
 
     def create_agent(
         self,
@@ -107,12 +178,14 @@ class KubernetesSandboxManager:
         state_sandbox_key: str = DEFAULT_SANDBOX_STATE_KEY,
         **create_deep_agent_kwargs: Any,
     ) -> Any:
-        """Return a compiled DeepAgents graph with automatic per-conversation sandbox management.
+        """Return a compiled LangGraph graph with streaming-compatible sandbox management.
 
-        This is the recommended integration point for most applications. Equivalent to
-        building a :class:`StateGraph` with :meth:`create_agent_node` but without the
-        boilerplate. Invoke with ``config={"configurable": {"thread_id": "..."}}`` to
-        route each conversation to its own persistent sandbox.
+        Uses a two-node architecture so the deepagent runs as a proper LangGraph
+        subgraph, enabling real-time streaming of LLM tokens and tool calls::
+
+            START → setup (acquire sandbox) → agent (deepagent subgraph) → END
+
+        ``sandbox_id`` is persisted in graph state and handled by the checkpointer.
 
         Args:
             model: A LangChain ``BaseChatModel`` passed to ``create_deep_agent()``.
@@ -121,13 +194,12 @@ class KubernetesSandboxManager:
                 directly (e.g. in FastAPI). The LangGraph Platform / ``langgraph dev``
                 provide their own checkpointer — pass ``None`` there.
             state_sandbox_key: State field name for the sandbox ID. Defaults to
-                ``"sandbox_id"``. For a custom key, use :meth:`create_agent_node`
-                and build the ``StateGraph`` directly.
+                ``"sandbox_id"``.
             **create_deep_agent_kwargs: Extra options forwarded to
                 ``create_deep_agent()`` (e.g. ``system_prompt``, ``tools``).
 
         Returns:
-            A compiled LangGraph graph with a single ``"agent"`` node.
+            Compiled ``StateGraph`` with ``"setup"`` and ``"agent"`` nodes.
 
         Example::
 
@@ -143,22 +215,27 @@ class KubernetesSandboxManager:
             # For langgraph dev / LangGraph Platform — no checkpointer needed
             graph = manager.create_agent(llm)
         """
-        from langgraph.graph import StateGraph, END
+        from deepagents import create_deep_agent
+        from langgraph.graph import END, START, StateGraph
         from typing import Annotated
         from typing_extensions import TypedDict
         from langchain_core.messages import AnyMessage
         from langgraph.graph.message import add_messages
 
+        backend_factory = self._make_backend_factory()
+        agent_subgraph = create_deep_agent(
+            model, backend=backend_factory, **create_deep_agent_kwargs
+        )
+
         class _AgentState(TypedDict):
             messages: Annotated[list[AnyMessage], add_messages]
             sandbox_id: str | None
 
-        node = self.create_agent_node(
-            model, state_sandbox_key=state_sandbox_key, **create_deep_agent_kwargs
-        )
-        builder = StateGraph(_AgentState)
-        builder.add_node("agent", node)
-        builder.set_entry_point("agent")
+        builder: StateGraph = StateGraph(_AgentState)
+        builder.add_node("setup", self.create_setup_node(state_sandbox_key=state_sandbox_key))
+        builder.add_node("agent", agent_subgraph)
+        builder.add_edge(START, "setup")
+        builder.add_edge("setup", "agent")
         builder.add_edge("agent", END)
         return builder.compile(checkpointer=checkpointer)
 

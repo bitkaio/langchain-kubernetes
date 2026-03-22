@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+#### KubernetesSandboxManager — streaming-compatible two-node architecture
+
+- `create_agent()` now builds a two-node `START → setup → agent → END` graph instead of a single-node graph. The deepagent is compiled once as a proper LangGraph subgraph node, which enables real-time streaming of LLM tokens and tool calls from LangGraph Studio and the LangGraph Platform.
+- New `_sandbox_by_thread: dict[str, KubernetesSandbox]` instance cache — the setup node populates it before the agent subgraph runs; the backend factory reads from it synchronously during agent execution.
+- New `_make_backend_factory()` private method: returns a sync callable that resolves the current thread's sandbox from `_sandbox_by_thread` via `langchain_core.runnables.config.ensure_config()`. Raises `RuntimeError` when `thread_id` is absent or the thread has no cached sandbox.
+- New `create_setup_node(*, state_sandbox_key="sandbox_id")` public method: returns an async LangGraph node that acquires (or reconnects) the sandbox, stores it in the cache, and writes the sandbox ID back to state when it changed. Intended to be wired before the deepagent subgraph in custom `StateGraph` builds.
+- `create_agent_node()` is unchanged and kept for backward compatibility.
+
+---
+
 ## [0.3.0] — 2026-03-21
 
 ### Added

@@ -163,7 +163,8 @@ packages, written files, and shell state must all be retained between messages.
 `KubernetesSandboxManager.createAgent(llm)` returns a ready-to-use DeepAgents agent that
 handles this automatically. Each turn it reconnects to the same sandbox using the
 conversation `thread_id`; if the sandbox has expired it provisions a new one
-transparently.
+transparently. The graph uses a two-node architecture (`setup → agent`) so LangGraph
+can stream LLM tokens and tool calls in real time.
 
 #### Behind Express / Hono
 
@@ -294,8 +295,9 @@ const agent = await manager.createAgent(llm, {
 
 | Method | Returns | Description |
 | ------ | ------- | ----------- |
-| `createAgent(model, options?)` | `Promise<CompiledGraph>` | Returns a compiled DeepAgents agent with sandbox persistence (primary integration point) |
-| `createAgentNode(model, options?)` | `AsyncNodeFn` | Returns a single LangGraph node; use when building a multi-node graph |
+| `createAgent(model, options?)` | `Promise<CompiledGraph>` | Returns a compiled two-node graph (`setup → agent`) with streaming and sandbox persistence (primary integration point) |
+| `createSetupNode(options?)` | `AsyncNodeFn` | Returns an async setup node; wire before the agent node in custom multi-node graphs |
+| `createAgentNode(model, options?)` | `AsyncNodeFn` | Returns a single LangGraph node (no streaming); kept for backward compatibility |
 | `getOrReconnect(sandboxId)` | `Promise<KubernetesSandbox>` | Reconnect or create; for custom node logic |
 | `cleanup(maxIdleSeconds?)` | `Promise<CleanupResult>` | Delete expired sandboxes |
 | `shutdown()` | `Promise<void>` | Delete all sandboxes |
@@ -356,9 +358,11 @@ interface SandboxListResponse {
 interface SandboxInfo {
   id: string;
   namespace: string;
+  threadId?: string;     // LangGraph thread_id if set at creation time
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
   createdAt?: string;    // ISO-8601
+  lastActivity?: string; // ISO-8601, updated after each execute()
   phase?: string;        // Kubernetes Pod phase
   status?: string;       // "running" | "warm" | "pending" | "terminated"
 }

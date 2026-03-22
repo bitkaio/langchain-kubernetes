@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from langchain_kubernetes.config import KubernetesProviderConfig
-from langchain_kubernetes.manager import KubernetesSandboxManager
+from langchain_kubernetes.manager import DEFAULT_SANDBOX_STATE_KEY, KubernetesSandboxManager
 from langchain_kubernetes.sandbox import KubernetesSandbox
 
 
@@ -194,3 +194,126 @@ class TestContextManager:
             async with manager:
                 pass
             mock_ashutdown.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _make_backend_factory
+# ---------------------------------------------------------------------------
+
+
+class TestMakeBackendFactory:
+    def _fake_config(self, thread_id: str | None) -> dict:
+        return {"configurable": {"thread_id": thread_id}} if thread_id else {}
+
+    def test_raises_when_no_thread_id(self):
+        manager = _make_manager()
+        factory = manager._make_backend_factory()
+
+        with patch(
+            "langchain_core.runnables.config.ensure_config",
+            return_value=self._fake_config(None),
+        ):
+            with pytest.raises(RuntimeError, match="no thread_id"):
+                factory(runtime=None)
+
+    def test_raises_when_sandbox_not_cached(self):
+        manager = _make_manager()
+        factory = manager._make_backend_factory()
+
+        with patch(
+            "langchain_core.runnables.config.ensure_config",
+            return_value=self._fake_config("thread-1"),
+        ):
+            with pytest.raises(RuntimeError, match="thread-1"):
+                factory(runtime=None)
+
+    def test_returns_cached_sandbox(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("cached-sb")
+        manager._sandbox_by_thread["thread-42"] = mock_sb
+        factory = manager._make_backend_factory()
+
+        with patch(
+            "langchain_core.runnables.config.ensure_config",
+            return_value=self._fake_config("thread-42"),
+        ):
+            result = factory(runtime=None)
+
+        assert result is mock_sb
+
+
+# ---------------------------------------------------------------------------
+# create_setup_node
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSetupNode:
+    @pytest.mark.asyncio
+    async def test_new_sandbox_populates_cache_and_returns_id(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("new-sandbox-id")
+
+        with patch.object(
+            manager, "_aget_or_reconnect", AsyncMock(return_value=mock_sb)
+        ):
+            node = manager.create_setup_node()
+            state = {DEFAULT_SANDBOX_STATE_KEY: None}
+            config = {"configurable": {"thread_id": "thread-new"}}
+            updates = await node(state, config)
+
+        assert manager._sandbox_by_thread["thread-new"] is mock_sb
+        assert updates[DEFAULT_SANDBOX_STATE_KEY] == "new-sandbox-id"
+
+    @pytest.mark.asyncio
+    async def test_existing_sandbox_populates_cache_and_returns_empty_updates(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("existing-id")
+
+        with patch.object(
+            manager, "_aget_or_reconnect", AsyncMock(return_value=mock_sb)
+        ):
+            node = manager.create_setup_node()
+            state = {DEFAULT_SANDBOX_STATE_KEY: "existing-id"}
+            config = {"configurable": {"thread_id": "thread-existing"}}
+            updates = await node(state, config)
+
+        assert manager._sandbox_by_thread["thread-existing"] is mock_sb
+        assert updates == {}
+
+    @pytest.mark.asyncio
+    async def test_raises_when_no_thread_id(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("sb-1")
+
+        with patch.object(
+            manager, "_aget_or_reconnect", AsyncMock(return_value=mock_sb)
+        ):
+            node = manager.create_setup_node()
+            with pytest.raises(RuntimeError, match="no thread_id"):
+                await node({DEFAULT_SANDBOX_STATE_KEY: None}, {})
+
+
+# ---------------------------------------------------------------------------
+# create_agent — graph structure
+# ---------------------------------------------------------------------------
+
+
+class TestCreateAgentGraphStructure:
+    def test_compiled_graph_has_setup_and_agent_nodes(self):
+        manager = _make_manager()
+        mock_model = MagicMock()
+        mock_subgraph = MagicMock()
+
+        with patch("deepagents.create_deep_agent", return_value=mock_subgraph), patch(
+            "langgraph.graph.StateGraph"
+        ) as MockStateGraph:
+            mock_builder = MagicMock()
+            MockStateGraph.return_value = mock_builder
+            mock_builder.compile.return_value = MagicMock()
+
+            manager.create_agent(mock_model)
+
+            # Both "setup" and "agent" nodes must be added
+            node_names = [call.args[0] for call in mock_builder.add_node.call_args_list]
+            assert "setup" in node_names
+            assert "agent" in node_names
