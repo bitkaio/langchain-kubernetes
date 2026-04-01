@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from langchain_kubernetes.config import KubernetesProviderConfig
-from langchain_kubernetes.manager import KubernetesSandboxManager
+from langchain_kubernetes.manager import DEFAULT_SANDBOX_STATE_KEY, KubernetesSandboxManager
 from langchain_kubernetes.sandbox import KubernetesSandbox
 
 
@@ -194,3 +194,179 @@ class TestContextManager:
             async with manager:
                 pass
             mock_ashutdown.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _make_backend_factory
+# ---------------------------------------------------------------------------
+
+
+class TestMakeBackendFactory:
+    def _fake_config(self, thread_id: str | None) -> dict:
+        return {"configurable": {"thread_id": thread_id}} if thread_id else {}
+
+    def test_raises_when_no_thread_id(self):
+        manager = _make_manager()
+        factory = manager._make_backend_factory()
+
+        with patch(
+            "langchain_core.runnables.config.ensure_config",
+            return_value=self._fake_config(None),
+        ):
+            with pytest.raises(RuntimeError, match="no thread_id"):
+                factory(runtime=None)
+
+    def test_lazy_acquires_when_sandbox_not_cached(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("lazy-sb")
+        factory = manager._make_backend_factory()
+
+        with patch(
+            "langchain_core.runnables.config.ensure_config",
+            return_value=self._fake_config("thread-1"),
+        ), patch.object(
+            manager._provider, "get_or_create", return_value=mock_sb
+        ) as mock_create:
+            result = factory(runtime=None)
+
+        assert result is mock_sb
+        assert manager._sandbox_by_thread["thread-1"] is mock_sb
+        mock_create.assert_called_once()
+
+    def test_returns_cached_sandbox(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("cached-sb")
+        manager._sandbox_by_thread["thread-42"] = mock_sb
+        factory = manager._make_backend_factory()
+
+        with patch(
+            "langchain_core.runnables.config.ensure_config",
+            return_value=self._fake_config("thread-42"),
+        ):
+            result = factory(runtime=None)
+
+        assert result is mock_sb
+
+    def test_lazy_acquire_does_not_call_provider_when_cached(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("cached-sb")
+        manager._sandbox_by_thread["thread-42"] = mock_sb
+        factory = manager._make_backend_factory()
+
+        with patch(
+            "langchain_core.runnables.config.ensure_config",
+            return_value=self._fake_config("thread-42"),
+        ), patch.object(
+            manager._provider, "get_or_create"
+        ) as mock_create:
+            factory(runtime=None)
+
+        mock_create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# create_setup_node
+# ---------------------------------------------------------------------------
+
+
+class TestCreateSetupNode:
+    @pytest.mark.asyncio
+    async def test_new_sandbox_populates_cache_and_returns_id(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("new-sandbox-id")
+
+        with patch.object(
+            manager, "_aget_or_reconnect", AsyncMock(return_value=mock_sb)
+        ):
+            node = manager.create_setup_node()
+            state = {DEFAULT_SANDBOX_STATE_KEY: None}
+            config = {"configurable": {"thread_id": "thread-new"}}
+            updates = await node(state, config)
+
+        assert manager._sandbox_by_thread["thread-new"] is mock_sb
+        assert updates[DEFAULT_SANDBOX_STATE_KEY] == "new-sandbox-id"
+
+    @pytest.mark.asyncio
+    async def test_existing_sandbox_populates_cache_and_returns_empty_updates(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("existing-id")
+
+        with patch.object(
+            manager, "_aget_or_reconnect", AsyncMock(return_value=mock_sb)
+        ):
+            node = manager.create_setup_node()
+            state = {DEFAULT_SANDBOX_STATE_KEY: "existing-id"}
+            config = {"configurable": {"thread_id": "thread-existing"}}
+            updates = await node(state, config)
+
+        assert manager._sandbox_by_thread["thread-existing"] is mock_sb
+        assert updates == {}
+
+    @pytest.mark.asyncio
+    async def test_raises_when_no_thread_id(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("sb-1")
+
+        with patch.object(
+            manager, "_aget_or_reconnect", AsyncMock(return_value=mock_sb)
+        ):
+            node = manager.create_setup_node()
+            with pytest.raises(RuntimeError, match="no thread_id"):
+                await node({DEFAULT_SANDBOX_STATE_KEY: None}, {})
+
+
+# ---------------------------------------------------------------------------
+# create_agent — returns deepagent directly
+# ---------------------------------------------------------------------------
+
+
+class TestCreateAgent:
+    def test_returns_deepagent_directly(self):
+        manager = _make_manager()
+        mock_model = MagicMock()
+        mock_agent = MagicMock()
+
+        with patch("deepagents.create_deep_agent", return_value=mock_agent) as mock_create:
+            result = manager.create_agent(mock_model)
+
+        assert result is mock_agent
+        mock_create.assert_called_once()
+        call_kwargs = mock_create.call_args[1] if mock_create.call_args[1] else {}
+        call_args = mock_create.call_args[0] if mock_create.call_args[0] else ()
+        # First positional arg is the model
+        assert call_args[0] is mock_model
+
+    def test_passes_backend_factory(self):
+        manager = _make_manager()
+        mock_model = MagicMock()
+        mock_agent = MagicMock()
+
+        with patch("deepagents.create_deep_agent", return_value=mock_agent) as mock_create:
+            manager.create_agent(mock_model)
+
+        call_kwargs = mock_create.call_args[1]
+        assert "backend" in call_kwargs
+        assert callable(call_kwargs["backend"])
+
+    def test_passes_checkpointer(self):
+        manager = _make_manager()
+        mock_model = MagicMock()
+        mock_checkpointer = MagicMock()
+        mock_agent = MagicMock()
+
+        with patch("deepagents.create_deep_agent", return_value=mock_agent) as mock_create:
+            manager.create_agent(mock_model, checkpointer=mock_checkpointer)
+
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["checkpointer"] is mock_checkpointer
+
+    def test_forwards_extra_kwargs(self):
+        manager = _make_manager()
+        mock_model = MagicMock()
+        mock_agent = MagicMock()
+
+        with patch("deepagents.create_deep_agent", return_value=mock_agent) as mock_create:
+            manager.create_agent(mock_model, system_prompt="Be helpful")
+
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["system_prompt"] == "Be helpful"
