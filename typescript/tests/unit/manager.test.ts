@@ -160,6 +160,21 @@ describe("KubernetesSandboxManager._makeBackendFactory", () => {
     expect(factory(null)).toBe(mockSandbox);
     vi.doUnmock("@langchain/core/singletons");
   });
+
+  it("does not call provider when sandbox is already cached", async () => {
+    const manager = makeManager();
+    const mockSandbox = makeMockSandbox("cached-sb");
+    manager._sandboxByThread.set("t-42", mockSandbox);
+    const spy = vi.spyOn(manager._provider, "getOrCreate");
+
+    vi.doMock("@langchain/core/singletons", () =>
+      fakeStorage({ configurable: { thread_id: "t-42" } })
+    );
+    const factory = await manager._makeBackendFactory();
+    factory(null);
+    expect(spy).not.toHaveBeenCalled();
+    vi.doUnmock("@langchain/core/singletons");
+  });
 });
 
 // ── createSetupNode ────────────────────────────────────────────────────────────
@@ -217,38 +232,112 @@ describe("KubernetesSandboxManager.createSetupNode", () => {
   });
 });
 
-// ── createAgent — graph structure ──────────────────────────────────────────────
+// ── _ensureSandbox ────────────────────────────────────────────────────────────
 
-describe("KubernetesSandboxManager.createAgent graph structure", () => {
-  it("compiled graph has setup and agent nodes", async () => {
+describe("KubernetesSandboxManager._ensureSandbox", () => {
+  it("acquires sandbox when not cached", async () => {
     const manager = makeManager();
+    const mockSandbox = makeMockSandbox("new-sb");
+    vi.spyOn(manager._provider, "getOrCreate").mockResolvedValue(mockSandbox);
 
-    const mockBuilder = {
-      addNode: vi.fn().mockReturnThis(),
-      addEdge: vi.fn().mockReturnThis(),
-      compile: vi.fn().mockReturnValue({ type: "graph" }),
-    };
+    await manager._ensureSandbox("thread-1");
 
-    vi.doMock("deepagents", () => ({ createDeepAgent: vi.fn().mockReturnValue({}) }));
+    expect(manager._sandboxByThread.get("thread-1")).toBe(mockSandbox);
+  });
+
+  it("is a no-op when sandbox already cached", async () => {
+    const manager = makeManager();
+    const existingSandbox = makeMockSandbox("existing-sb");
+    manager._sandboxByThread.set("thread-1", existingSandbox);
+    const spy = vi.spyOn(manager._provider, "getOrCreate");
+
+    await manager._ensureSandbox("thread-1");
+
+    expect(spy).not.toHaveBeenCalled();
+    expect(manager._sandboxByThread.get("thread-1")).toBe(existingSandbox);
+  });
+});
+
+// ── createAgent — returns proxied deepagent ──────────────────────────────────
+
+describe("KubernetesSandboxManager.createAgent", () => {
+  it("returns a proxy wrapping the deepagent (not a StateGraph)", async () => {
+    const manager = makeManager();
+    const mockAgent = { type: "deepagent", invoke: vi.fn() };
+    const mockCreateDeepAgent = vi.fn().mockReturnValue(mockAgent);
+
+    vi.doMock("deepagents", () => ({ createDeepAgent: mockCreateDeepAgent }));
     vi.doMock("@langchain/core/singletons", () => fakeStorage(undefined));
-    vi.doMock("@langchain/langgraph", () => ({
-      StateGraph: vi.fn().mockReturnValue(mockBuilder),
-      END: "__end__",
-      Annotation: {
-        Root: vi.fn().mockReturnValue({}),
-        call: vi.fn().mockReturnValue({}),
-      },
-    }));
 
-    await manager.createAgent({} as never);
+    const result = await manager.createAgent({} as never);
 
-    const nodeNames = mockBuilder.addNode.mock.calls.map((c) => c[0]);
-    expect(nodeNames).toContain("setup");
-    expect(nodeNames).toContain("agent");
+    // It's a proxy — accessing non-method properties passes through
+    expect((result as Record<string, unknown>)["type"]).toBe("deepagent");
+    expect(mockCreateDeepAgent).toHaveBeenCalledOnce();
 
     vi.doUnmock("deepagents");
     vi.doUnmock("@langchain/core/singletons");
-    vi.doUnmock("@langchain/langgraph");
+  });
+
+  it("passes backend factory and checkpointer to createDeepAgent", async () => {
+    const manager = makeManager();
+    const mockAgent = { type: "deepagent" };
+    const mockCreateDeepAgent = vi.fn().mockReturnValue(mockAgent);
+    const mockCheckpointer = { type: "checkpointer" };
+
+    vi.doMock("deepagents", () => ({ createDeepAgent: mockCreateDeepAgent }));
+    vi.doMock("@langchain/core/singletons", () => fakeStorage(undefined));
+
+    await manager.createAgent({} as never, { checkpointer: mockCheckpointer });
+
+    const callArgs = mockCreateDeepAgent.mock.calls[0][1];
+    expect(callArgs.backend).toBeDefined();
+    expect(typeof callArgs.backend).toBe("function");
+    expect(callArgs.checkpointer).toBe(mockCheckpointer);
+
+    vi.doUnmock("deepagents");
+    vi.doUnmock("@langchain/core/singletons");
+  });
+
+  it("forwards extra options to createDeepAgent", async () => {
+    const manager = makeManager();
+    const mockCreateDeepAgent = vi.fn().mockReturnValue({});
+
+    vi.doMock("deepagents", () => ({ createDeepAgent: mockCreateDeepAgent }));
+    vi.doMock("@langchain/core/singletons", () => fakeStorage(undefined));
+
+    await manager.createAgent({} as never, { systemPrompt: "Be helpful" });
+
+    const callArgs = mockCreateDeepAgent.mock.calls[0][1];
+    expect(callArgs.systemPrompt).toBe("Be helpful");
+
+    vi.doUnmock("deepagents");
+    vi.doUnmock("@langchain/core/singletons");
+  });
+
+  it("invoke wrapper calls _ensureSandbox before delegating", async () => {
+    const manager = makeManager();
+    const mockInvoke = vi.fn().mockResolvedValue({ messages: [] });
+    const mockAgent = { invoke: mockInvoke };
+    const mockCreateDeepAgent = vi.fn().mockReturnValue(mockAgent);
+
+    vi.doMock("deepagents", () => ({ createDeepAgent: mockCreateDeepAgent }));
+    vi.doMock("@langchain/core/singletons", () => fakeStorage(undefined));
+
+    const spy = vi.spyOn(manager, "_ensureSandbox").mockResolvedValue();
+    const agent = await manager.createAgent({} as never);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (agent as any).invoke(
+      { messages: [] },
+      { configurable: { thread_id: "t-1" } }
+    );
+
+    expect(spy).toHaveBeenCalledWith("t-1");
+    expect(mockInvoke).toHaveBeenCalledOnce();
+
+    vi.doUnmock("deepagents");
+    vi.doUnmock("@langchain/core/singletons");
   });
 });
 

@@ -82,15 +82,13 @@ export class KubernetesSandboxManager {
   // ── Primary integration point: compiled agent factory ─────────────────────
 
   /**
-   * Return a backend factory that resolves the cached sandbox for the current
+   * Return a backend factory that reads the cached sandbox for the current
    * LangGraph thread via the `@langchain/core` AsyncLocalStorage context.
    *
-   * The factory is sync (deepagents requirement). It reads the `thread_id` from
-   * the LangGraph config that is propagated through `AsyncLocalStorage` during
-   * graph execution — the same mechanism Python's `ensure_config()` uses.
-   *
-   * Must be called before compiling the agent subgraph so the import resolves
-   * once and is captured in the closure.
+   * The factory is sync (deepagents requirement). The sandbox must be
+   * preloaded into `_sandboxByThread` before the factory is called —
+   * `createAgent()` handles this automatically by wrapping the agent's
+   * `invoke`/`stream` methods to call `_ensureSandbox()` first.
    *
    * @internal
    */
@@ -117,11 +115,25 @@ export class KubernetesSandboxManager {
       if (!sandbox) {
         throw new Error(
           `KubernetesSandboxManager: no sandbox cached for thread ${JSON.stringify(threadId)}. ` +
-            "Ensure the setup node runs before the agent."
+            "Ensure the sandbox is preloaded before the agent runs."
         );
       }
       return sandbox;
     };
+  }
+
+  /**
+   * Ensure a sandbox is cached for the given `thread_id`.
+   *
+   * If one already exists in `_sandboxByThread`, this is a no-op. Otherwise
+   * acquires a new sandbox via the provider and caches it.
+   *
+   * @internal
+   */
+  async _ensureSandbox(threadId: string): Promise<void> {
+    if (this._sandboxByThread.has(threadId)) return;
+    const sandbox = await this._getOrReconnect(undefined);
+    this._sandboxByThread.set(threadId, sandbox);
   }
 
   /**
@@ -166,16 +178,13 @@ export class KubernetesSandboxManager {
   }
 
   /**
-   * Return a compiled LangGraph graph with streaming-compatible sandbox management.
+   * Return a deepagent graph with lazy sandbox acquisition.
    *
-   * Uses a two-node architecture so the deepagent runs as a proper LangGraph
-   * subgraph, enabling real-time streaming of LLM tokens and tool calls:
-   *
-   * ```
-   * START → setup (acquire sandbox) → agent (deepagent subgraph) → END
-   * ```
-   *
-   * `sandboxId` is persisted in graph state and handled by the checkpointer.
+   * The sandbox is acquired synchronously on the first tool call for a given
+   * `thread_id` via `_makeBackendFactory()`. No wrapper `StateGraph` is used,
+   * so all deepagent steps (todos, tool calls, LLM tokens) are emitted as
+   * top-level graph events — visible in the Deep Agent UI and LangGraph
+   * Platform streaming.
    *
    * @param model - A LangChain `BaseChatModel` (or compatible) passed to
    *   `createDeepAgent()`.
@@ -184,7 +193,8 @@ export class KubernetesSandboxManager {
    *   Express). The LangGraph Platform / `langgraph dev` provide their own
    *   checkpointer — omit it there.
    * @param options.stateSandboxKey - State field name for the sandbox ID.
-   *   Defaults to `"sandboxId"`.
+   *   Accepted for API compatibility but unused — sandbox IDs live in
+   *   `_sandboxByThread`, not in graph state.
    * @param options - Extra options forwarded to `createDeepAgent()`.
    *
    * @example Express — pass a checkpointer
@@ -215,30 +225,40 @@ export class KubernetesSandboxManager {
   ): Promise<unknown> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const { createDeepAgent } = await import("deepagents" as any);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { StateGraph, END, Annotation } = await import("@langchain/langgraph" as any);
 
     const backendFactory = await this._makeBackendFactory();
-    const agentSubgraph = createDeepAgent(model, { backend: backendFactory, ...createDeepAgentOptions });
-
-    const AgentState = Annotation.Root({
-      messages: Annotation({
-        reducer: (a: unknown[], b: unknown[]) => [...(a ?? []), ...(Array.isArray(b) ? b : [b])],
-      }),
-      [stateSandboxKey]: Annotation({
-        reducer: (_: unknown, b: unknown) => b,
-      }),
+    const agent = createDeepAgent(model, {
+      backend: backendFactory,
+      checkpointer,
+      ...createDeepAgentOptions,
     });
 
-    const graph = new StateGraph(AgentState)
-      .addNode("setup", this.createSetupNode({ stateSandboxKey }))
-      .addNode("agent", agentSubgraph)
-      .addEdge("__start__", "setup")
-      .addEdge("setup", "agent")
-      .addEdge("agent", END)
-      .compile(checkpointer ? { checkpointer } : undefined);
-
-    return graph;
+    // Wrap the agent so the sandbox is acquired (async) before each
+    // invocation. The sync backend factory then finds it in the cache.
+    // This avoids a dedicated setup node while keeping agent steps at the
+    // top level for streaming visibility.
+    const manager = this;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler: ProxyHandler<any> = {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver);
+        if (
+          typeof value === "function" &&
+          (prop === "invoke" || prop === "ainvoke" || prop === "stream" || prop === "streamEvents")
+        ) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return async function (this: unknown, input: unknown, config?: any, ...rest: unknown[]) {
+            const threadId = config?.configurable?.thread_id as string | undefined;
+            if (threadId) {
+              await manager._ensureSandbox(threadId);
+            }
+            return value.call(target, input, config, ...rest);
+          };
+        }
+        return value;
+      },
+    };
+    return new Proxy(agent, handler);
   }
 
   // ── LangGraph node factory (backward-compatible) ───────────────────────────

@@ -216,16 +216,22 @@ class TestMakeBackendFactory:
             with pytest.raises(RuntimeError, match="no thread_id"):
                 factory(runtime=None)
 
-    def test_raises_when_sandbox_not_cached(self):
+    def test_lazy_acquires_when_sandbox_not_cached(self):
         manager = _make_manager()
+        mock_sb = _make_mock_sandbox("lazy-sb")
         factory = manager._make_backend_factory()
 
         with patch(
             "langchain_core.runnables.config.ensure_config",
             return_value=self._fake_config("thread-1"),
-        ):
-            with pytest.raises(RuntimeError, match="thread-1"):
-                factory(runtime=None)
+        ), patch.object(
+            manager._provider, "get_or_create", return_value=mock_sb
+        ) as mock_create:
+            result = factory(runtime=None)
+
+        assert result is mock_sb
+        assert manager._sandbox_by_thread["thread-1"] is mock_sb
+        mock_create.assert_called_once()
 
     def test_returns_cached_sandbox(self):
         manager = _make_manager()
@@ -240,6 +246,22 @@ class TestMakeBackendFactory:
             result = factory(runtime=None)
 
         assert result is mock_sb
+
+    def test_lazy_acquire_does_not_call_provider_when_cached(self):
+        manager = _make_manager()
+        mock_sb = _make_mock_sandbox("cached-sb")
+        manager._sandbox_by_thread["thread-42"] = mock_sb
+        factory = manager._make_backend_factory()
+
+        with patch(
+            "langchain_core.runnables.config.ensure_config",
+            return_value=self._fake_config("thread-42"),
+        ), patch.object(
+            manager._provider, "get_or_create"
+        ) as mock_create:
+            factory(runtime=None)
+
+        mock_create.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -294,26 +316,57 @@ class TestCreateSetupNode:
 
 
 # ---------------------------------------------------------------------------
-# create_agent — graph structure
+# create_agent — returns deepagent directly
 # ---------------------------------------------------------------------------
 
 
-class TestCreateAgentGraphStructure:
-    def test_compiled_graph_has_setup_and_agent_nodes(self):
+class TestCreateAgent:
+    def test_returns_deepagent_directly(self):
         manager = _make_manager()
         mock_model = MagicMock()
-        mock_subgraph = MagicMock()
+        mock_agent = MagicMock()
 
-        with patch("deepagents.create_deep_agent", return_value=mock_subgraph), patch(
-            "langgraph.graph.StateGraph"
-        ) as MockStateGraph:
-            mock_builder = MagicMock()
-            MockStateGraph.return_value = mock_builder
-            mock_builder.compile.return_value = MagicMock()
+        with patch("deepagents.create_deep_agent", return_value=mock_agent) as mock_create:
+            result = manager.create_agent(mock_model)
 
+        assert result is mock_agent
+        mock_create.assert_called_once()
+        call_kwargs = mock_create.call_args[1] if mock_create.call_args[1] else {}
+        call_args = mock_create.call_args[0] if mock_create.call_args[0] else ()
+        # First positional arg is the model
+        assert call_args[0] is mock_model
+
+    def test_passes_backend_factory(self):
+        manager = _make_manager()
+        mock_model = MagicMock()
+        mock_agent = MagicMock()
+
+        with patch("deepagents.create_deep_agent", return_value=mock_agent) as mock_create:
             manager.create_agent(mock_model)
 
-            # Both "setup" and "agent" nodes must be added
-            node_names = [call.args[0] for call in mock_builder.add_node.call_args_list]
-            assert "setup" in node_names
-            assert "agent" in node_names
+        call_kwargs = mock_create.call_args[1]
+        assert "backend" in call_kwargs
+        assert callable(call_kwargs["backend"])
+
+    def test_passes_checkpointer(self):
+        manager = _make_manager()
+        mock_model = MagicMock()
+        mock_checkpointer = MagicMock()
+        mock_agent = MagicMock()
+
+        with patch("deepagents.create_deep_agent", return_value=mock_agent) as mock_create:
+            manager.create_agent(mock_model, checkpointer=mock_checkpointer)
+
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["checkpointer"] is mock_checkpointer
+
+    def test_forwards_extra_kwargs(self):
+        manager = _make_manager()
+        mock_model = MagicMock()
+        mock_agent = MagicMock()
+
+        with patch("deepagents.create_deep_agent", return_value=mock_agent) as mock_create:
+            manager.create_agent(mock_model, system_prompt="Be helpful")
+
+        call_kwargs = mock_create.call_args[1]
+        assert call_kwargs["system_prompt"] == "Be helpful"

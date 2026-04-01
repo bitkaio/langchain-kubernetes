@@ -11,13 +11,13 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-#### KubernetesSandboxManager — streaming-compatible two-node architecture
+#### KubernetesSandboxManager — lazy sandbox acquisition, top-level deepagent
 
-- `create_agent()` now builds a two-node `START → setup → agent → END` graph instead of a single-node graph. The deepagent is compiled once as a proper LangGraph subgraph node, which enables real-time streaming of LLM tokens and tool calls from LangGraph Studio and the LangGraph Platform.
-- New `_sandbox_by_thread: dict[str, KubernetesSandbox]` instance cache — the setup node populates it before the agent subgraph runs; the backend factory reads from it synchronously during agent execution.
-- New `_make_backend_factory()` private method: returns a sync callable that resolves the current thread's sandbox from `_sandbox_by_thread` via `langchain_core.runnables.config.ensure_config()`. Raises `RuntimeError` when `thread_id` is absent or the thread has no cached sandbox.
-- New `create_setup_node(*, state_sandbox_key="sandbox_id")` public method: returns an async LangGraph node that acquires (or reconnects) the sandbox, stores it in the cache, and writes the sandbox ID back to state when it changed. Intended to be wired before the deepagent subgraph in custom `StateGraph` builds.
-- `create_agent_node()` is unchanged and kept for backward compatibility.
+- `create_agent()` now returns the deepagent graph directly (via `create_deep_agent()`) instead of wrapping it in a `StateGraph(setup → agent)`. All deepagent steps (todos, tool calls, LLM tokens) are emitted as top-level graph events — visible in the Deep Agent UI and LangGraph Platform streaming.
+- `_make_backend_factory()` now lazily acquires the sandbox on first tool call using a `ThreadPoolExecutor`, instead of requiring a dedicated setup node. The K8s I/O runs in a worker thread so the ASGI event loop thread stays free (avoids `blockbuster.BlockingError`).
+- Module-level `_sandbox_acquire_executor` (`ThreadPoolExecutor`, 4 workers) added for the lazy acquisition path.
+- `_sandbox_by_thread` instance cache is still populated, but now by the backend factory on first call rather than by a setup node.
+- `create_setup_node()` and `create_agent_node()` are unchanged and kept for backward compatibility / custom graph builds.
 
 ---
 

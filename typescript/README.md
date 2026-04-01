@@ -163,8 +163,8 @@ packages, written files, and shell state must all be retained between messages.
 `KubernetesSandboxManager.createAgent(llm)` returns a ready-to-use DeepAgents agent that
 handles this automatically. Each turn it reconnects to the same sandbox using the
 conversation `thread_id`; if the sandbox has expired it provisions a new one
-transparently. The graph uses a two-node architecture (`setup → agent`) so LangGraph
-can stream LLM tokens and tool calls in real time.
+transparently. The sandbox is acquired lazily on first invocation, and the deepagent
+runs as the top-level graph so all steps (LLM tokens, tool calls) stream in real time.
 
 #### Behind Express / Hono
 
@@ -295,7 +295,7 @@ const agent = await manager.createAgent(llm, {
 
 | Method | Returns | Description |
 | ------ | ------- | ----------- |
-| `createAgent(model, options?)` | `Promise<CompiledGraph>` | Returns a compiled two-node graph (`setup → agent`) with streaming and sandbox persistence (primary integration point) |
+| `createAgent(model, options?)` | `Promise<CompiledGraph>` | Returns the deepagent directly with lazy sandbox acquisition — all steps visible at top level (primary integration point) |
 | `createSetupNode(options?)` | `AsyncNodeFn` | Returns an async setup node; wire before the agent node in custom multi-node graphs |
 | `createAgentNode(model, options?)` | `AsyncNodeFn` | Returns a single LangGraph node (no streaming); kept for backward compatibility |
 | `getOrReconnect(sandboxId)` | `Promise<KubernetesSandbox>` | Reconnect or create; for custom node logic |

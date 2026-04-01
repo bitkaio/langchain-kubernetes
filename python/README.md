@@ -350,8 +350,8 @@ packages, written files, and shell state must all be retained between messages.
 `KubernetesSandboxManager.create_agent()` returns a ready-to-use DeepAgents agent that
 handles this automatically. Each turn it reconnects to the same sandbox using the
 conversation `thread_id`; if the sandbox has expired it provisions a new one
-transparently. The agent graph uses a two-node architecture (`setup → agent`) so LangGraph
-can stream LLM tokens and tool calls in real time.
+transparently. The sandbox is acquired lazily on the first tool call, and the deepagent
+runs as the top-level graph so all steps (LLM tokens, tool calls) stream in real time.
 
 #### Behind FastAPI
 
@@ -551,7 +551,7 @@ async with KubernetesSandboxManager(config) as manager:
 
 | Method | Returns | Description |
 | ------ | ------- | ----------- |
-| `create_agent(model, *, checkpointer=None, **kwargs)` | `CompiledGraph` | Returns a compiled two-node graph (`setup → agent`) with streaming and sandbox persistence (primary integration point) |
+| `create_agent(model, *, checkpointer=None, **kwargs)` | `CompiledGraph` | Returns the deepagent directly with lazy sandbox acquisition — all steps visible at top level (primary integration point) |
 | `create_setup_node(*, state_sandbox_key="sandbox_id")` | `Callable` | Returns an async setup node; wire before the agent node in custom multi-node graphs |
 | `create_agent_node(model, *, state_sandbox_key="sandbox_id", **kwargs)` | `Callable` | Returns a single LangGraph node (no streaming); kept for backward compatibility |
 | `get_or_reconnect(sandbox_id)` | `Coroutine[KubernetesSandbox]` | Reconnect or create; for custom node logic |

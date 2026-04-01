@@ -11,13 +11,14 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-#### KubernetesSandboxManager — streaming-compatible two-node architecture
+#### KubernetesSandboxManager — lazy sandbox acquisition, top-level deepagent
 
-- `createAgent()` now builds a two-node `__start__ → setup → agent → __end__` graph instead of a single-node graph. The deepagent is compiled once as a proper LangGraph subgraph node, which enables real-time streaming of LLM tokens and tool calls from LangGraph Studio and the LangGraph Platform.
-- New `_sandboxByThread: Map<string, KubernetesSandbox>` instance cache — the setup node populates it before the agent subgraph runs; the backend factory reads from it synchronously during agent execution.
-- New `_makeBackendFactory()` method (async, `@internal`): resolves `@langchain/core/singletons` once on startup, then returns a sync callable. The factory reads the current `thread_id` from `AsyncLocalStorageProviderSingleton` (the same mechanism LangGraph uses to propagate config through `AsyncLocalStorage`) and looks up the sandbox in `_sandboxByThread`. Throws `Error` when `thread_id` is absent or the thread has no cached sandbox.
-- New `createSetupNode({ stateSandboxKey? })` public method: returns an async LangGraph node that acquires (or reconnects) the sandbox, stores it in the cache, and writes the sandbox ID back to state when it changed. Reads `thread_id` from the `config` argument passed by LangGraph to every node.
-- `createAgentNode()` is unchanged and kept for backward compatibility.
+- `createAgent()` now returns a Proxy-wrapped deepagent graph (via `createDeepAgent()`) instead of wrapping it in a `StateGraph(setup → agent)`. All deepagent steps (todos, tool calls, LLM tokens) are emitted as top-level graph events — visible in the Deep Agent UI and LangGraph Platform streaming.
+- The Proxy intercepts `invoke`, `ainvoke`, `stream`, and `streamEvents` to call `_ensureSandbox(threadId)` before delegating, so the sandbox is acquired lazily on first invocation — no dedicated setup node required.
+- New `_ensureSandbox(threadId)` method (`@internal`): acquires a sandbox via `getOrCreate()` and caches it in `_sandboxByThread` if not already present; no-op when cached.
+- `_makeBackendFactory()` is simplified: throws when sandbox is not cached (the Proxy wrapper guarantees preloading).
+- `_sandboxByThread` instance cache is still populated, but now by `_ensureSandbox()` (called from the Proxy) rather than by a setup node.
+- `createSetupNode()` and `createAgentNode()` are unchanged and kept for backward compatibility / custom graph builds.
 
 ---
 
