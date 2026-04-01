@@ -7,7 +7,7 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [0.4.0] — 2026-04-01
 
 ### Changed
 
@@ -113,5 +113,6 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Full file I/O: `uploadFiles` / `downloadFiles` via tar-over-exec (raw) and base64-encoded exec (agent-sandbox).
 - 65 unit tests.
 
+[0.4.0]: https://github.com/bitkaio/langchain-kubernetes/compare/typescript/v0.3.0...typescript/v0.4.0
 [0.3.0]: https://github.com/bitkaio/langchain-kubernetes/compare/typescript/v0.2.0...typescript/v0.3.0
 [0.2.0]: https://github.com/bitkaio/langchain-kubernetes/releases/tag/typescript/v0.2.0

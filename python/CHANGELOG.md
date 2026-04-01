@@ -7,7 +7,7 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [0.4.0] — 2026-04-01
 
 ### Changed
 
@@ -111,5 +111,6 @@ Versions follow [Semantic Versioning](https://semver.org/).
 - Full file I/O: `upload_files` / `download_files` via tar-over-exec (raw) and `SandboxClient` file methods (agent-sandbox).
 - 181 unit tests.
 
+[0.4.0]: https://github.com/bitkaio/langchain-kubernetes/compare/python/v0.3.0...python/v0.4.0
 [0.3.0]: https://github.com/bitkaio/langchain-kubernetes/compare/python/v0.2.0...python/v0.3.0
 [0.2.0]: https://github.com/bitkaio/langchain-kubernetes/releases/tag/python/v0.2.0
