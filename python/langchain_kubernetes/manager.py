@@ -9,6 +9,7 @@ checkpointer — no Kubernetes label writes or direct cluster API access require
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -20,6 +21,10 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+_sandbox_acquire_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="sandbox-acquire"
+)
 
 # Key used to store sandbox ID in LangGraph graph state by default.
 DEFAULT_SANDBOX_STATE_KEY = "sandbox_id"
@@ -94,10 +99,93 @@ class KubernetesSandboxManager:
         self._ttl_seconds = ttl_seconds
         self._ttl_idle_seconds = ttl_idle_seconds
         self._default_labels = default_labels
+        self._sandbox_by_thread: dict[str, KubernetesSandbox] = {}
 
     # ------------------------------------------------------------------
     # Primary integration point: LangGraph node factory
     # ------------------------------------------------------------------
+
+    def _make_backend_factory(self) -> Callable:
+        """Return a sync backend factory with lazy sandbox acquisition.
+
+        On the first call for a given thread_id the sandbox is acquired
+        synchronously via _provider.get_or_create() running in a thread-pool
+        executor so the event loop thread is not blocked (avoids blockbuster
+        BlockingError). Subsequent calls for the same thread_id return the
+        cached sandbox with no I/O.
+
+        This removes the requirement for a setup node, allowing create_agent()
+        to return the deepagent directly (no wrapper StateGraph), so all
+        deepagent steps are visible at the top level in the Deep Agent UI.
+        """
+        manager = self
+
+        def factory(runtime: Any) -> "KubernetesSandbox":
+            from langchain_core.runnables.config import ensure_config
+
+            config = ensure_config()
+            thread_id: str | None = (config.get("configurable") or {}).get("thread_id")
+            if thread_id is None:
+                raise RuntimeError(
+                    "KubernetesSandboxManager: no thread_id in LangGraph config. "
+                    "Invoke with config={'configurable': {'thread_id': '...'}}."
+                )
+            sandbox = manager._sandbox_by_thread.get(thread_id)
+            if sandbox is None:
+                # Lazy acquisition — run blocking K8s I/O in a thread pool so the
+                # event loop thread stays free (avoids blockbuster BlockingError).
+                future = _sandbox_acquire_executor.submit(
+                    manager._provider.get_or_create,
+                    labels=manager._default_labels,
+                    ttl_seconds=manager._ttl_seconds,
+                    ttl_idle_seconds=manager._ttl_idle_seconds,
+                )
+                sandbox = future.result()
+                manager._sandbox_by_thread[thread_id] = sandbox
+            return sandbox
+
+        return factory
+
+    def create_setup_node(
+        self,
+        *,
+        state_sandbox_key: str = DEFAULT_SANDBOX_STATE_KEY,
+    ) -> Callable:
+        """Return an async LangGraph node that acquires the sandbox and caches it.
+
+        Reads ``state[state_sandbox_key]`` to reconnect an existing sandbox (or
+        provision a new one), stores it in ``_sandbox_by_thread[thread_id]``, and
+        writes the (possibly new) ``sandbox_id`` back to state.
+
+        Must be wired to run before the deepagent subgraph node.
+
+        Args:
+            state_sandbox_key: State field that holds the sandbox ID.
+
+        Returns:
+            An ``async def setup_node(state, config)`` function.
+        """
+        manager = self
+
+        async def setup_node(state: dict[str, Any], config: Any = None) -> dict[str, Any]:
+            from langchain_core.runnables.config import ensure_config
+
+            cfg = config or ensure_config()
+            thread_id: str | None = (cfg.get("configurable") or {}).get("thread_id")
+            if thread_id is None:
+                raise RuntimeError(
+                    "KubernetesSandboxManager setup_node: no thread_id in config."
+                )
+            sandbox_id: str | None = state.get(state_sandbox_key)
+            sandbox = await manager._aget_or_reconnect(sandbox_id)
+            manager._sandbox_by_thread[thread_id] = sandbox
+            updates: dict[str, Any] = {}
+            if sandbox.id != sandbox_id:
+                updates[state_sandbox_key] = sandbox.id
+            return updates
+
+        setup_node.__name__ = "setup_node"
+        return setup_node
 
     def create_agent(
         self,
@@ -107,12 +195,13 @@ class KubernetesSandboxManager:
         state_sandbox_key: str = DEFAULT_SANDBOX_STATE_KEY,
         **create_deep_agent_kwargs: Any,
     ) -> Any:
-        """Return a compiled DeepAgents graph with automatic per-conversation sandbox management.
+        """Return a deepagent graph with lazy sandbox acquisition.
 
-        This is the recommended integration point for most applications. Equivalent to
-        building a :class:`StateGraph` with :meth:`create_agent_node` but without the
-        boilerplate. Invoke with ``config={"configurable": {"thread_id": "..."}}`` to
-        route each conversation to its own persistent sandbox.
+        The sandbox is acquired synchronously on the first tool call for a given
+        thread_id via ``_make_backend_factory()``. No wrapper ``StateGraph`` is
+        used, so all deepagent steps (todos, tool calls, LLM tokens) are emitted
+        as top-level graph events — visible in the Deep Agent UI and LangGraph
+        Platform streaming.
 
         Args:
             model: A LangChain ``BaseChatModel`` passed to ``create_deep_agent()``.
@@ -120,14 +209,14 @@ class KubernetesSandboxManager:
                 …). Required for multi-turn conversations when calling ``.invoke()``
                 directly (e.g. in FastAPI). The LangGraph Platform / ``langgraph dev``
                 provide their own checkpointer — pass ``None`` there.
-            state_sandbox_key: State field name for the sandbox ID. Defaults to
-                ``"sandbox_id"``. For a custom key, use :meth:`create_agent_node`
-                and build the ``StateGraph`` directly.
+            state_sandbox_key: State field name for the sandbox ID. Accepted for
+                API compatibility but unused — sandbox IDs live in
+                ``_sandbox_by_thread``, not in graph state.
             **create_deep_agent_kwargs: Extra options forwarded to
                 ``create_deep_agent()`` (e.g. ``system_prompt``, ``tools``).
 
         Returns:
-            A compiled LangGraph graph with a single ``"agent"`` node.
+            Compiled deepagent graph.
 
         Example::
 
@@ -143,24 +232,12 @@ class KubernetesSandboxManager:
             # For langgraph dev / LangGraph Platform — no checkpointer needed
             graph = manager.create_agent(llm)
         """
-        from langgraph.graph import StateGraph, END
-        from typing import Annotated
-        from typing_extensions import TypedDict
-        from langchain_core.messages import AnyMessage
-        from langgraph.graph.message import add_messages
+        from deepagents import create_deep_agent
 
-        class _AgentState(TypedDict):
-            messages: Annotated[list[AnyMessage], add_messages]
-            sandbox_id: str | None
-
-        node = self.create_agent_node(
-            model, state_sandbox_key=state_sandbox_key, **create_deep_agent_kwargs
+        backend_factory = self._make_backend_factory()
+        return create_deep_agent(
+            model, backend=backend_factory, checkpointer=checkpointer, **create_deep_agent_kwargs
         )
-        builder = StateGraph(_AgentState)
-        builder.add_node("agent", node)
-        builder.set_entry_point("agent")
-        builder.add_edge("agent", END)
-        return builder.compile(checkpointer=checkpointer)
 
     def create_agent_node(
         self,

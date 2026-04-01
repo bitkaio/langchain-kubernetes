@@ -7,6 +7,20 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+#### KubernetesSandboxManager — lazy sandbox acquisition, top-level deepagent
+
+- `create_agent()` now returns the deepagent graph directly (via `create_deep_agent()`) instead of wrapping it in a `StateGraph(setup → agent)`. All deepagent steps (todos, tool calls, LLM tokens) are emitted as top-level graph events — visible in the Deep Agent UI and LangGraph Platform streaming.
+- `_make_backend_factory()` now lazily acquires the sandbox on first tool call using a `ThreadPoolExecutor`, instead of requiring a dedicated setup node. The K8s I/O runs in a worker thread so the ASGI event loop thread stays free (avoids `blockbuster.BlockingError`).
+- Module-level `_sandbox_acquire_executor` (`ThreadPoolExecutor`, 4 workers) added for the lazy acquisition path.
+- `_sandbox_by_thread` instance cache is still populated, but now by the backend factory on first call rather than by a setup node.
+- `create_setup_node()` and `create_agent_node()` are unchanged and kept for backward compatibility / custom graph builds.
+
+---
+
 ## [0.3.0] — 2026-03-21
 
 ### Added

@@ -7,6 +7,21 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+#### KubernetesSandboxManager — lazy sandbox acquisition, top-level deepagent
+
+- `createAgent()` now returns a Proxy-wrapped deepagent graph (via `createDeepAgent()`) instead of wrapping it in a `StateGraph(setup → agent)`. All deepagent steps (todos, tool calls, LLM tokens) are emitted as top-level graph events — visible in the Deep Agent UI and LangGraph Platform streaming.
+- The Proxy intercepts `invoke`, `ainvoke`, `stream`, and `streamEvents` to call `_ensureSandbox(threadId)` before delegating, so the sandbox is acquired lazily on first invocation — no dedicated setup node required.
+- New `_ensureSandbox(threadId)` method (`@internal`): acquires a sandbox via `getOrCreate()` and caches it in `_sandboxByThread` if not already present; no-op when cached.
+- `_makeBackendFactory()` is simplified: throws when sandbox is not cached (the Proxy wrapper guarantees preloading).
+- `_sandboxByThread` instance cache is still populated, but now by `_ensureSandbox()` (called from the Proxy) rather than by a setup node.
+- `createSetupNode()` and `createAgentNode()` are unchanged and kept for backward compatibility / custom graph builds.
+
+---
+
 ## [0.3.0] — 2026-03-21
 
 ### Added
